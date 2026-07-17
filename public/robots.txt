@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://v-look-up-tool.vercel.app/sitemap.xml
