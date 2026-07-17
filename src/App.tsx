@@ -47,9 +47,10 @@ function App() {
   const triggerFileInputB = () => fileInputRefB.current?.click();
 
   // Join Configuration states
-  const [joinColA, setJoinColA] = useState<string>('');
-  const [joinColB, setJoinColB] = useState<string>('');
+  const [joinKeys, setJoinKeys] = useState<{ colA: string; colB: string }[]>([{ colA: '', colB: '' }]);
   const [joinType, setJoinType] = useState<'left' | 'right' | 'inner' | 'outer'>('left');
+  const [fuzzyMatch, setFuzzyMatch] = useState(false);
+  const [fuzzyThreshold, setFuzzyThreshold] = useState(0.8);
   
   const [selectedColsA, setSelectedColsA] = useState<ColumnConfig[]>([]);
   const [selectedColsB, setSelectedColsB] = useState<ColumnConfig[]>([]);
@@ -179,7 +180,12 @@ function App() {
     
     if (isFileA) {
       setFileA(parsedFile);
-      setJoinColA(headers[0] || '');
+      setJoinKeys(prev => {
+        const next = [...prev];
+        if (next.length === 0) next.push({ colA: '', colB: '' });
+        next[0] = { ...next[0], colA: headers[0] || '' };
+        return next;
+      });
       setSelectedColsA(headers.map(h => ({
         original: h,
         output: h,
@@ -187,7 +193,12 @@ function App() {
       })));
     } else {
       setFileB(parsedFile);
-      setJoinColB(headers[0] || '');
+      setJoinKeys(prev => {
+        const next = [...prev];
+        if (next.length === 0) next.push({ colA: '', colB: '' });
+        next[0] = { ...next[0], colB: headers[0] || '' };
+        return next;
+      });
       
       // Auto suffix columns that conflict with File A
       const fileACols = fileA ? fileA.headers : [];
@@ -234,13 +245,12 @@ function App() {
   const removeFile = (isFileA: boolean) => {
     if (isFileA) {
       setFileA(null);
-      setJoinColA('');
       setSelectedColsA([]);
     } else {
       setFileB(null);
-      setJoinColB('');
       setSelectedColsB([]);
     }
+    setJoinKeys([{ colA: '', colB: '' }]);
     setJoinedData([]);
     setAlert({ type: 'info', message: `Removed ${isFileA ? 'Primary' : 'Lookup'} file.` });
   };
@@ -248,8 +258,7 @@ function App() {
   const clearAllCache = () => {
     setFileA(null);
     setFileB(null);
-    setJoinColA('');
-    setJoinColB('');
+    setJoinKeys([{ colA: '', colB: '' }]);
     setSelectedColsA([]);
     setSelectedColsB([]);
     setJoinedData([]);
@@ -303,6 +312,48 @@ function App() {
     return hasEmptyA || hasEmptyB;
   }, [selectedColsA, selectedColsB]);
 
+  // Levenshtein distance function for fuzzy matching
+  const getSimilarity = (s1: string, s2: string): number => {
+    const len1 = s1.length;
+    const len2 = s2.length;
+    const matrix: number[][] = [];
+    
+    for (let i = 0; i <= len1; i++) matrix[i] = [i];
+    for (let j = 0; j <= len2; j++) matrix[0][j] = j;
+    
+    for (let i = 1; i <= len1; i++) {
+      for (let j = 1; j <= len2; j++) {
+        const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j - 1] + cost
+        );
+      }
+    }
+    const maxLength = Math.max(len1, len2);
+    if (maxLength === 0) return 1.0;
+    return (maxLength - matrix[len1][len2]) / maxLength;
+  };
+
+  const handleJoinKeyChange = (index: number, side: 'colA' | 'colB', value: string) => {
+    setJoinKeys(prev => {
+      const next = [...prev];
+      next[index] = { ...next[index], [side]: value };
+      return next;
+    });
+  };
+
+  const addJoinKeyRow = () => {
+    const defaultA = fileA?.headers[0] || '';
+    const defaultB = fileB?.headers[0] || '';
+    setJoinKeys(prev => [...prev, { colA: defaultA, colB: defaultB }]);
+  };
+
+  const removeJoinKeyRow = (index: number) => {
+    setJoinKeys(prev => prev.filter((_, i) => i !== index));
+  };
+
   // Core Relational Join logic executed inside a debounced useEffect
   useEffect(() => {
     if (!fileA || !fileB) {
@@ -319,6 +370,7 @@ function App() {
 
         // Standardized Join Logic
         const getKey = (row: any, col: string) => {
+          if (!row) return "";
           let val = row[col];
           if (val === undefined || val === null) return "";
           val = String(val);
@@ -329,63 +381,129 @@ function App() {
 
         const result: any[] = [];
 
-        // Index Table B by Join Column B
-        const indexB = new Map<string, any[]>();
-        fileB.data.forEach(row => {
-          const key = getKey(row, joinColB);
-          if (!indexB.has(key)) indexB.set(key, []);
-          indexB.get(key)!.push(row);
-        });
+        if (!fuzzyMatch) {
+          // Fast Indexed Join using Composite Keys
+          const getCompositeKey = (row: any, useColA: boolean) => {
+            return joinKeys.map(jk => getKey(row, useColA ? jk.colA : jk.colB)).join("|||");
+          };
 
-        const matchedKeysB = new Set<string>();
+          const indexB = new Map<string, any[]>();
+          fileB.data.forEach(row => {
+            const key = getCompositeKey(row, false);
+            if (!indexB.has(key)) indexB.set(key, []);
+            indexB.get(key)!.push(row);
+          });
 
-        // Process Table A Rows
-        fileA.data.forEach(rowA => {
-          const keyA = getKey(rowA, joinColA);
-          const matchesB = indexB.get(keyA);
+          const matchedKeysB = new Set<string>();
 
-          if (matchesB && matchesB.length > 0) {
-            matchedKeysB.add(keyA);
-            matchesB.forEach(rowB => {
-              const joinedRow: any = {};
-              activeColsA.forEach(c => {
-                joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+          fileA.data.forEach(rowA => {
+            const keyA = getCompositeKey(rowA, true);
+            const matchesB = indexB.get(keyA);
+
+            if (matchesB && matchesB.length > 0) {
+              matchedKeysB.add(keyA);
+              matchesB.forEach(rowB => {
+                const joinedRow: any = {};
+                activeColsA.forEach(c => {
+                  joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+                });
+                activeColsB.forEach(c => {
+                  joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+                });
+                result.push(joinedRow);
               });
-              activeColsB.forEach(c => {
-                joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
-              });
-              result.push(joinedRow);
-            });
-          } else {
-            // No match in B
-            if (joinType === 'left' || joinType === 'outer') {
-              const joinedRow: any = {};
-              activeColsA.forEach(c => {
-                joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
-              });
-              activeColsB.forEach(c => {
-                joinedRow[c.output] = "";
-              });
-              result.push(joinedRow);
+            } else {
+              if (joinType === 'left' || joinType === 'outer') {
+                const joinedRow: any = {};
+                activeColsA.forEach(c => {
+                  joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+                });
+                activeColsB.forEach(c => {
+                  joinedRow[c.output] = "";
+                });
+                result.push(joinedRow);
+              }
             }
-          }
-        });
+          });
 
-        // Process Unmatched Table B Rows (for Right & Outer Joins)
-        if (joinType === 'right' || joinType === 'outer') {
-          fileB.data.forEach(rowB => {
-            const keyB = getKey(rowB, joinColB);
-            if (!matchedKeysB.has(keyB)) {
+          if (joinType === 'right' || joinType === 'outer') {
+            fileB.data.forEach(rowB => {
+              const keyB = getCompositeKey(rowB, false);
+              if (!matchedKeysB.has(keyB)) {
+                const joinedRow: any = {};
+                activeColsA.forEach(c => {
+                  joinedRow[c.output] = "";
+                });
+                activeColsB.forEach(c => {
+                  joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+                });
+                result.push(joinedRow);
+              }
+            });
+          }
+        } else {
+          // Fuzzy Join (nested loops with threshold)
+          const matchedRowsB = new Set<any>();
+
+          fileA.data.forEach(rowA => {
+            let matched = false;
+
+            fileB.data.forEach(rowB => {
+              const firstKeyA = getKey(rowA, joinKeys[0].colA);
+              const firstKeyB = getKey(rowB, joinKeys[0].colB);
+              const sim = getSimilarity(firstKeyA, firstKeyB);
+
+              if (sim >= fuzzyThreshold) {
+                let remainingMatch = true;
+                for (let k = 1; k < joinKeys.length; k++) {
+                  if (getKey(rowA, joinKeys[k].colA) !== getKey(rowB, joinKeys[k].colB)) {
+                    remainingMatch = false;
+                    break;
+                  }
+                }
+
+                if (remainingMatch) {
+                  matched = true;
+                  matchedRowsB.add(rowB);
+                  
+                  const joinedRow: any = {};
+                  activeColsA.forEach(c => {
+                    joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+                  });
+                  activeColsB.forEach(c => {
+                    joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+                  });
+                  result.push(joinedRow);
+                }
+              }
+            });
+
+            if (!matched && (joinType === 'left' || joinType === 'outer')) {
               const joinedRow: any = {};
               activeColsA.forEach(c => {
-                joinedRow[c.output] = "";
+                joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
               });
               activeColsB.forEach(c => {
-                joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+                joinedRow[c.output] = "";
               });
               result.push(joinedRow);
             }
           });
+
+          if (joinType === 'right' || joinType === 'outer') {
+            fileB.data.forEach(rowB => {
+              if (!matchedRowsB.has(rowB)) {
+                const joinedRow: any = {};
+                activeColsA.forEach(c => {
+                  joinedRow[c.output] = "";
+                });
+                activeColsB.forEach(c => {
+                  joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+                });
+                result.push(joinedRow);
+              }
+            });
+          }
         }
 
         setJoinedData(result);
@@ -398,6 +516,11 @@ function App() {
           setAlert({
             type: 'warning',
             message: 'Empty Header Warning: One or more selected output columns have empty names. Please enter a valid header name.'
+          });
+        } else if (fuzzyMatch && (fileA.data.length > 2000 || fileB.data.length > 2000)) {
+          setAlert({
+            type: 'warning',
+            message: `Large Dataset Warning: Fuzzy matching on ${fileA.data.length}x${fileB.data.length} rows may cause browser latency. It is recommended for smaller datasets.`
           });
         } else {
           setAlert(null);
@@ -413,15 +536,16 @@ function App() {
   }, [
     fileA,
     fileB,
-    joinColA,
-    joinColB,
+    joinKeys,
     joinType,
     selectedColsA,
     selectedColsB,
     caseInsensitive,
     trimWhitespace,
     duplicateOutputNames,
-    hasEmptyOutputNames
+    hasEmptyOutputNames,
+    fuzzyMatch,
+    fuzzyThreshold
   ]);
 
   // Export File & Download Trigger
@@ -708,33 +832,58 @@ function App() {
             <h2 className="section-title">Configure Relational Join</h2>
           </div>
 
-          {/* Join Key Selection */}
-          <div className="join-keys-grid">
-            <div className="form-group">
-              <label className="form-label">Match Column from File A</label>
-              <select
-                className="select-control"
-                value={joinColA}
-                onChange={(e) => setJoinColA(e.target.value)}
-              >
-                {fileA.headers.map((h, i) => (
-                  <option key={i} value={h}>{h}</option>
-                ))}
-              </select>
+          {/* Join Key Selection List */}
+          <div className="form-group">
+            <div className="join-keys-list">
+              {joinKeys.map((keyRow, index) => (
+                <div key={index} className="join-key-row">
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.25rem' }}>Match Column from File A</label>
+                    <select
+                      className="select-control"
+                      value={keyRow.colA}
+                      onChange={(e) => handleJoinKeyChange(index, 'colA', e.target.value)}
+                    >
+                      {fileA.headers.map((h, i) => (
+                        <option key={i} value={h}>{h}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.25rem' }}>Matches Column from File B</label>
+                    <select
+                      className="select-control"
+                      value={keyRow.colB}
+                      onChange={(e) => handleJoinKeyChange(index, 'colB', e.target.value)}
+                    >
+                      {fileB.headers.map((h, i) => (
+                        <option key={i} value={h}>{h}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    {joinKeys.length > 1 && (
+                      <button
+                        className="btn btn-secondary btn-danger btn-icon-only"
+                        type="button"
+                        onClick={() => removeJoinKeyRow(index)}
+                        style={{ height: '42px', width: '42px' }}
+                      >
+                        <Trash2 style={{ width: '1rem', height: '1rem' }} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
-
-            <div className="form-group">
-              <label className="form-label">Matches Column from File B</label>
-              <select
-                className="select-control"
-                value={joinColB}
-                onChange={(e) => setJoinColB(e.target.value)}
-              >
-                {fileB.headers.map((h, i) => (
-                  <option key={i} value={h}>{h}</option>
-                ))}
-              </select>
-            </div>
+            <button
+              className="btn btn-secondary"
+              type="button"
+              onClick={addJoinKeyRow}
+              style={{ fontSize: '0.85rem', padding: '0.5rem 1rem' }}
+            >
+              + Add Match Key
+            </button>
           </div>
 
           {/* Join Type Selectors */}
@@ -796,7 +945,39 @@ function App() {
               />
               <span>Trim Whitespace (ignores leading/trailing spaces)</span>
             </label>
+
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                className="checkbox-control"
+                checked={fuzzyMatch}
+                onChange={(e) => setFuzzyMatch(e.target.checked)}
+              />
+              <span style={{ color: 'var(--primary-hover)', fontWeight: 600 }}>Enable Fuzzy Match (Levenshtein Distance)</span>
+            </label>
           </div>
+
+          {/* Fuzzy Threshold Slider */}
+          {fuzzyMatch && (
+            <div className="slider-container animate-fade-in" style={{ padding: '1rem', background: 'rgba(255, 255, 255, 0.02)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', marginBottom: '1.5rem' }}>
+              <div className="slider-header">
+                <span>Fuzzy Match Similarity Threshold</span>
+                <span style={{ color: 'var(--primary-hover)', fontWeight: 600 }}>{Math.round(fuzzyThreshold * 100)}% Match</span>
+              </div>
+              <input
+                type="range"
+                className="range-input"
+                min="0.5"
+                max="1.0"
+                step="0.05"
+                value={fuzzyThreshold}
+                onChange={(e) => setFuzzyThreshold(parseFloat(e.target.value))}
+              />
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+                Note: Fuzzy matching evaluates string similarity on the primary match key. Lower percentages accept looser spelling matches.
+              </div>
+            </div>
+          )}
 
           {/* Dynamic Column Schema Setup */}
           <div className="section-header" style={{ borderBottom: 'none', marginBottom: '0.5rem' }}>
@@ -833,7 +1014,7 @@ function App() {
                       <div className="schema-col-info">
                         <div className="schema-col-name" title={col.original}>
                           {col.original}
-                          {col.original === joinColA && (
+                          {joinKeys.some(jk => jk.colA === col.original) && (
                             <span className="badge badge-success" style={{ marginLeft: '0.5rem', fontSize: '0.65rem' }}>Match Key</span>
                           )}
                         </div>
@@ -878,7 +1059,7 @@ function App() {
                       <div className="schema-col-info">
                         <div className="schema-col-name" title={col.original}>
                           {col.original}
-                          {col.original === joinColB && (
+                          {joinKeys.some(jk => jk.colB === col.original) && (
                             <span className="badge badge-success" style={{ marginLeft: '0.5rem', fontSize: '0.65rem' }}>Match Key</span>
                           )}
                         </div>

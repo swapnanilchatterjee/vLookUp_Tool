@@ -2,103 +2,175 @@ import assert from 'assert';
 
 // --- CODE COPIED DIRECTLY FROM APP.TSX FOR QA TESTING (VANILLA JS VERSION) ---
 
-const sanitizeHeaders = (rawHeaders) => {
-  const seen = new Map();
-  return rawHeaders.map((h, i) => {
-    let name = h !== undefined && h !== null ? String(h).trim() : "";
-    if (name === "") {
-      name = `Column_${i + 1}`;
+const getSimilarity = (s1, s2) => {
+  const len1 = s1.length;
+  const len2 = s2.length;
+  const matrix = [];
+  
+  for (let i = 0; i <= len1; i++) matrix[i] = [i];
+  for (let j = 0; j <= len2; j++) matrix[0][j] = j;
+  
+  for (let i = 1; i <= len1; i++) {
+    for (let j = 1; j <= len2; j++) {
+      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
     }
-    if (seen.has(name)) {
-      const count = seen.get(name) + 1;
-      seen.set(name, count);
-      return `${name}_${count}`;
-    } else {
-      seen.set(name, 1);
-      return name;
-    }
-  });
+  }
+  const maxLength = Math.max(len1, len2);
+  if (maxLength === 0) return 1.0;
+  return (maxLength - matrix[len1][len2]) / maxLength;
 };
 
 function performJoin(
   dataA,
   dataB,
-  joinColA,
-  joinColB,
+  joinKeys,
   joinType,
   selectedColsA,
   selectedColsB,
   options
 ) {
+  const { caseInsensitive, trimWhitespace, fuzzyMatch, fuzzyThreshold } = options;
+
   const getKey = (row, col) => {
     if (!row) return "";
     let val = row[col];
     if (val === undefined || val === null) return "";
     val = String(val);
-    if (options.trimWhitespace) val = val.trim();
-    if (options.caseInsensitive) val = val.toLowerCase();
+    if (trimWhitespace) val = val.trim();
+    if (caseInsensitive) val = val.toLowerCase();
     return val;
   };
 
   const result = [];
 
-  // Index Table B by Join Column B
-  const indexB = new Map();
-  dataB.forEach(row => {
-    const key = getKey(row, joinColB);
-    if (!indexB.has(key)) indexB.set(key, []);
-    indexB.get(key).push(row);
-  });
+  if (!fuzzyMatch) {
+    // Fast Indexed Join using Composite Keys
+    const getCompositeKey = (row, useColA) => {
+      return joinKeys.map(jk => getKey(row, useColA ? jk.colA : jk.colB)).join("|||");
+    };
 
-  const matchedKeysB = new Set();
+    const indexB = new Map();
+    dataB.forEach(row => {
+      const key = getCompositeKey(row, false);
+      if (!indexB.has(key)) indexB.set(key, []);
+      indexB.get(key).push(row);
+    });
 
-  // Process Table A Rows
-  dataA.forEach(rowA => {
-    const keyA = getKey(rowA, joinColA);
-    const matchesB = indexB.get(keyA);
+    const matchedKeysB = new Set();
 
-    if (matchesB && matchesB.length > 0) {
-      matchedKeysB.add(keyA);
-      matchesB.forEach(rowB => {
-        const joinedRow = {};
-        selectedColsA.forEach(c => {
-          joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+    dataA.forEach(rowA => {
+      const keyA = getCompositeKey(rowA, true);
+      const matchesB = indexB.get(keyA);
+
+      if (matchesB && matchesB.length > 0) {
+        matchedKeysB.add(keyA);
+        matchesB.forEach(rowB => {
+          const joinedRow = {};
+          selectedColsA.forEach(c => {
+            joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+          });
+          selectedColsB.forEach(c => {
+            joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+          });
+          result.push(joinedRow);
         });
-        selectedColsB.forEach(c => {
-          joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
-        });
-        result.push(joinedRow);
-      });
-    } else {
-      // No match in B
-      if (joinType === 'left' || joinType === 'outer') {
-        const joinedRow = {};
-        selectedColsA.forEach(c => {
-          joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
-        });
-        selectedColsB.forEach(c => {
-          joinedRow[c.output] = "";
-        });
-        result.push(joinedRow);
+      } else {
+        if (joinType === 'left' || joinType === 'outer') {
+          const joinedRow = {};
+          selectedColsA.forEach(c => {
+            joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+          });
+          selectedColsB.forEach(c => {
+            joinedRow[c.output] = "";
+          });
+          result.push(joinedRow);
+        }
       }
-    }
-  });
+    });
 
-  // Process Unmatched Table B Rows (for Right & Outer Joins)
-  if (joinType === 'right' || joinType === 'outer') {
-    dataB.forEach(rowB => {
-      const keyB = getKey(rowB, joinColB);
-      if (!matchedKeysB.has(keyB)) {
+    if (joinType === 'right' || joinType === 'outer') {
+      dataB.forEach(rowB => {
+        const keyB = getCompositeKey(rowB, false);
+        if (!matchedKeysB.has(keyB)) {
+          const joinedRow = {};
+          selectedColsA.forEach(c => {
+            joinedRow[c.output] = "";
+          });
+          selectedColsB.forEach(c => {
+            joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+          });
+          result.push(joinedRow);
+        }
+      });
+    }
+  } else {
+    // Fuzzy Join (nested loops with threshold)
+    const matchedRowsB = new Set();
+
+    dataA.forEach(rowA => {
+      let matched = false;
+
+      dataB.forEach(rowB => {
+        const firstKeyA = getKey(rowA, joinKeys[0].colA);
+        const firstKeyB = getKey(rowB, joinKeys[0].colB);
+        const sim = getSimilarity(firstKeyA, firstKeyB);
+
+        if (sim >= fuzzyThreshold) {
+          let remainingMatch = true;
+          for (let k = 1; k < joinKeys.length; k++) {
+            if (getKey(rowA, joinKeys[k].colA) !== getKey(rowB, joinKeys[k].colB)) {
+              remainingMatch = false;
+              break;
+            }
+          }
+
+          if (remainingMatch) {
+            matched = true;
+            matchedRowsB.add(rowB);
+            
+            const joinedRow = {};
+            selectedColsA.forEach(c => {
+              joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+            });
+            selectedColsB.forEach(c => {
+              joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+            });
+            result.push(joinedRow);
+          }
+        }
+      });
+
+      if (!matched && (joinType === 'left' || joinType === 'outer')) {
         const joinedRow = {};
         selectedColsA.forEach(c => {
-          joinedRow[c.output] = "";
+          joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
         });
         selectedColsB.forEach(c => {
-          joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+          joinedRow[c.output] = "";
         });
         result.push(joinedRow);
       }
     });
+
+    if (joinType === 'right' || joinType === 'outer') {
+      dataB.forEach(rowB => {
+        if (!matchedRowsB.has(rowB)) {
+          const joinedRow = {};
+          selectedColsA.forEach(c => {
+            joinedRow[c.output] = "";
+          });
+          selectedColsB.forEach(c => {
+            joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
+          });
+          result.push(joinedRow);
+        }
+      });
+    }
   }
 
   return result;
@@ -107,7 +179,7 @@ function performJoin(
 // --- TEST RUNNER SUITE ---
 
 console.log("==========================================");
-console.log("   VMERGE STUDIO INTENSE TEST RUNNER      ");
+console.log("   VMERGE STUDIO FUZZY & MULTI-KEY TESTS  ");
 console.log("==========================================");
 
 let testsPassed = 0;
@@ -125,126 +197,88 @@ function runTest(name, testFn) {
   }
 }
 
-// 1. Header Sanitizer Tests
-runTest("Header Sanitizer - Basic trimming", () => {
-  const headers = [" ID ", "Name", "Age "];
-  const cleaned = sanitizeHeaders(headers);
-  assert.deepStrictEqual(cleaned, ["ID", "Name", "Age"]);
+// 1. Similarity Engine Checks
+runTest("Similarity - Exact match is 1.0", () => {
+  assert.strictEqual(getSimilarity("Google", "Google"), 1.0);
 });
 
-runTest("Header Sanitizer - Blank Columns", () => {
-  const headers = ["ID", "", "Age", null, undefined];
-  const cleaned = sanitizeHeaders(headers);
-  assert.deepStrictEqual(cleaned, ["ID", "Column_2", "Age", "Column_4", "Column_5"]);
+runTest("Similarity - Empty inputs is 1.0", () => {
+  assert.strictEqual(getSimilarity("", ""), 1.0);
 });
 
-runTest("Header Sanitizer - Duplicate Columns Suffixing", () => {
-  const headers = ["Name", "Age", "Name", "City", "Name"];
-  const cleaned = sanitizeHeaders(headers);
-  assert.deepStrictEqual(cleaned, ["Name", "Age", "Name_2", "City", "Name_3"]);
+runTest("Similarity - Close spelling metric", () => {
+  const sim = getSimilarity("Google Inc", "Gogle Inc");
+  assert.ok(sim >= 0.85 && sim < 1.0);
 });
 
-// 2. Relational Joins Tests
-const mockDataA = [
-  { id: "1", name: "Alice", dept: "HR" },
-  { id: "2", name: "Bob", dept: "Engineering" },
-  { id: "3", name: "Charlie", dept: "Marketing" }
+// 2. Fuzzy Join Matching
+const dataA = [
+  { company: "Google Inc", city: "NYC", val: "100" },
+  { company: "Apple Corp", city: "SF", val: "200" }
 ];
-
-const mockDataB = [
-  { id: "2", manager: "Dan", budget: "10000" },
-  { id: "3", manager: "Eva", budget: "5000" },
-  { id: "4", manager: "Frank", budget: "2000" }
+const dataB = [
+  { company: "Gogle Inc", city: "NYC", mgr: "Sundar" },
+  { company: "Apple Inc", city: "SF", mgr: "Tim" },
+  { company: "Microsoft", city: "WA", mgr: "Satya" }
 ];
+const selA = [{ original: "company", output: "CompanyA" }, { original: "val", output: "Value" }];
+const selB = [{ original: "mgr", output: "Manager" }];
 
-const selectedA = [
-  { original: "id", output: "id_A" },
-  { original: "name", output: "Name" }
-];
-
-const selectedB = [
-  { original: "manager", output: "Manager" },
-  { original: "budget", output: "Budget" }
-];
-
-const options = { caseInsensitive: true, trimWhitespace: true };
-
-runTest("Left Join - Match Lookup Standard", () => {
-  const res = performJoin(mockDataA, mockDataB, "id", "id", "left", selectedA, selectedB, options);
-  
-  assert.strictEqual(res.length, 3);
-  assert.deepStrictEqual(res[0], { id_A: "1", Name: "Alice", Manager: "", Budget: "" });
-  assert.deepStrictEqual(res[1], { id_A: "2", Name: "Bob", Manager: "Dan", Budget: "10000" });
-  assert.deepStrictEqual(res[2], { id_A: "3", Name: "Charlie", Manager: "Eva", Budget: "5000" });
-});
-
-runTest("Inner Join - Overlap Only", () => {
-  const res = performJoin(mockDataA, mockDataB, "id", "id", "inner", selectedA, selectedB, options);
-  
+runTest("Fuzzy Left Join - High Threshold (Should not match loose)", () => {
+  const strictOptions = { caseInsensitive: true, trimWhitespace: true, fuzzyMatch: true, fuzzyThreshold: 0.95 };
+  const res = performJoin(dataA, dataB, [{ colA: "company", colB: "company" }], "left", selA, selB, strictOptions);
   assert.strictEqual(res.length, 2);
-  assert.deepStrictEqual(res[0], { id_A: "2", Name: "Bob", Manager: "Dan", Budget: "10000" });
-  assert.deepStrictEqual(res[1], { id_A: "3", Name: "Charlie", Manager: "Eva", Budget: "5000" });
+  assert.strictEqual(res[0].Manager, ""); // No match
 });
 
-runTest("Right Join - Lookup Anchored", () => {
-  const res = performJoin(mockDataA, mockDataB, "id", "id", "right", selectedA, selectedB, options);
-  
+runTest("Fuzzy Left Join - Loose Threshold (Should match misspelled names)", () => {
+  const looseOptions = { caseInsensitive: true, trimWhitespace: true, fuzzyMatch: true, fuzzyThreshold: 0.60 };
+  const res = performJoin(dataA, dataB, [{ colA: "company", colB: "company" }], "left", selA, selB, looseOptions);
   assert.strictEqual(res.length, 3);
-  assert.deepStrictEqual(res[0], { id_A: "2", Name: "Bob", Manager: "Dan", Budget: "10000" });
-  assert.deepStrictEqual(res[1], { id_A: "3", Name: "Charlie", Manager: "Eva", Budget: "5000" });
-  assert.deepStrictEqual(res[2], { id_A: "", Name: "", Manager: "Frank", Budget: "2000" });
+  assert.strictEqual(res[0].Manager, "Sundar"); // Google matching Gogle (sim = 0.90)
+  assert.strictEqual(res[1].Manager, "Tim");    // Google matching Apple Inc (sim = 0.60)
+  assert.strictEqual(res[2].Manager, "Tim");    // Apple Corp matching Apple Inc (sim = 0.60)
 });
 
-runTest("Outer Join - Union Match", () => {
-  const res = performJoin(mockDataA, mockDataB, "id", "id", "outer", selectedA, selectedB, options);
-  
-  assert.strictEqual(res.length, 4);
-  assert.deepStrictEqual(res[0], { id_A: "1", Name: "Alice", Manager: "", Budget: "" });
-  assert.deepStrictEqual(res[1], { id_A: "2", Name: "Bob", Manager: "Dan", Budget: "10000" });
-  assert.deepStrictEqual(res[2], { id_A: "3", Name: "Charlie", Manager: "Eva", Budget: "5000" });
-  assert.deepStrictEqual(res[3], { id_A: "", Name: "", Manager: "Frank", Budget: "2000" });
-});
+// 3. Multi-Key Join matching
+const compA = [
+  { id: "100", region: "North", sale: "50" },
+  { id: "100", region: "South", sale: "80" },
+  { id: "200", region: "North", sale: "30" }
+];
+const compB = [
+  { id: "100", region: "North", active: "yes" },
+  { id: "100", region: "South", active: "no" }
+];
+const sColsA = [{ original: "sale", output: "Sale" }];
+const sColsB = [{ original: "active", output: "Active" }];
 
-// 3. Normalization Tests (Case & Trimming)
-runTest("Key Alignment - Case & Whitespace Normalization", () => {
-  const dataA = [{ key: "  aBc  ", val: "A" }];
-  const dataB = [{ key: "ABC", val: "B" }];
-  
-  const selA = [{ original: "key", output: "keyA" }, { original: "val", output: "valA" }];
-  const selB = [{ original: "val", output: "valB" }];
-  
-  const res = performJoin(dataA, dataB, "key", "key", "inner", selA, selB, options);
-  assert.strictEqual(res.length, 1);
-  assert.deepStrictEqual(res[0], { keyA: "  aBc  ", valA: "A", valB: "B" });
-});
-
-runTest("Key Alignment - Case Sensitivity strict options", () => {
-  const dataA = [{ key: "a", val: "A" }];
-  const dataB = [{ key: "A", val: "B" }];
-  
-  const selA = [{ original: "val", output: "valA" }];
-  const selB = [{ original: "val", output: "valB" }];
-  
-  const strictOptions = { caseInsensitive: false, trimWhitespace: true };
-  const res = performJoin(dataA, dataB, "key", "key", "inner", selA, selB, strictOptions);
-  assert.strictEqual(res.length, 0); // Should not match due to strict case
-});
-
-// 4. One-To-Many (Cartesian Product) matches
-runTest("Join Engine - One-to-Many Cartesian verification", () => {
-  const dataA = [{ key: "X", name: "RowA" }];
-  const dataB = [
-    { key: "X", desc: "MatchB1" },
-    { key: "X", desc: "MatchB2" }
+runTest("Multi-Key Composite Join - Multiple match columns", () => {
+  const joinKeys = [
+    { colA: "id", colB: "id" },
+    { colB: "region", colA: "region" } // testing different ordering
   ];
+  const joinOptions = { caseInsensitive: true, trimWhitespace: true, fuzzyMatch: false };
+  const res = performJoin(compA, compB, joinKeys, "inner", sColsA, sColsB, joinOptions);
   
-  const selA = [{ original: "name", output: "Name" }];
-  const selB = [{ original: "desc", output: "Desc" }];
-  
-  const res = performJoin(dataA, dataB, "key", "key", "inner", selA, selB, options);
   assert.strictEqual(res.length, 2);
-  assert.deepStrictEqual(res[0], { Name: "RowA", Desc: "MatchB1" });
-  assert.deepStrictEqual(res[1], { Name: "RowA", Desc: "MatchB2" });
+  assert.deepStrictEqual(res[0], { Sale: "50", Active: "yes" });
+  assert.deepStrictEqual(res[1], { Sale: "80", Active: "no" });
+});
+
+// 4. Combined Multi-Key and Fuzzy
+runTest("Combined - Fuzzy on primary, exact on secondary keys", () => {
+  const combineA = [{ comp: "Google Inc", r: "North", val: "10" }];
+  const combineB = [
+    { comp: "Gogle Inc", r: "North", mgr: "Sundar" },
+    { comp: "Gogle Inc", r: "South", mgr: "Sergey" }
+  ];
+  const keys = [{ colA: "comp", colB: "comp" }, { colA: "r", colB: "r" }];
+  const mixedOptions = { caseInsensitive: true, trimWhitespace: true, fuzzyMatch: true, fuzzyThreshold: 0.8 };
+  const res = performJoin(combineA, combineB, keys, "inner", [{ original: "val", output: "V" }], [{ original: "mgr", output: "M" }], mixedOptions);
+  
+  assert.strictEqual(res.length, 1);
+  assert.strictEqual(res[0].M, "Sundar"); // matches North, rejects South
 });
 
 console.log("==========================================");

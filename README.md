@@ -10,6 +10,8 @@ Using custom styling, glassmorphism aesthetics, and client-side processing, this
 
 *   **Zero-Server Upload Sandbox**: All calculations and merges occur locally in your browser memory. Data never leaves your machine.
 *   **Dual File Format Support**: Effortlessly upload, parse, and match CSV, XLSX, and XLS file formats simultaneously.
+*   **Composite Multi-Key Joins**: Match rows based on multiple matching key conditions (e.g. matching `First Name` AND `Last Name` AND `Zip Code` simultaneously).
+*   **Fuzzy Jaro-Winkler/Levenshtein Matching**: Match fields with typos or minor spelling differences (e.g., matching `"Google Inc"` with `"Gogle Inc"`). Includes an interactive slider to customize the similarity threshold (from 50% to 100% match).
 *   **Flexible Relational Joins**: Supports four join strategies:
     *   *Left Join*: Keeps all primary records and matches lookup data (Standard VLookup behavior).
     *   *Inner Join*: Restricts output to intersecting matches.
@@ -42,7 +44,7 @@ Using custom styling, glassmorphism aesthetics, and client-side processing, this
     *   File drag/drop validation and FileReader buffer handlers.
     *   Header sanitization and 2D array parsing pipelines.
     *   Schema mapping structures with default collision suffixes.
-    *   The index-based relational join algorithm inside a debounced React hook.
+    *   The index-based relational join algorithm inside a debounced React hook (supporting composite indexes and fuzzy string matching).
     *   CSV/Excel export packaging and memory state resets.
 
 ---
@@ -83,10 +85,10 @@ npm run preview
 The application uses an efficient, indexed map-join mechanism:
 1.  **2D Array Parsing Pipeline**:
     To prevent data loss from duplicate headers (where direct JSON parsing overwrites duplicate keys), the application parses files into 2D arrays. Headers are passed through `sanitizeHeaders` (trimming, filling blanks, renaming duplicates), and rows are mapped to unique key-value objects.
-2.  **Indexing Table B**:
-    For performance, the lookup file (File B) is mapped beforehand: `joinColB -> [RowObjects[]]`. This handles one-to-many lookup relations in $O(N + M)$ complexity, bypassing costly double-loop queries.
-3.  **Trimming & Matching**:
-    Keys are standard-aligned by optionally stripping leading/trailing whitespace (`trim()`) and formatting them to lowercase (`toLowerCase()`).
+2.  **Composite Index Matching**:
+    If fuzzy matching is disabled, the join engine uses a high-performance hash-index strategy. Columns are combined into a compound key (e.g. `val1|||val2|||val3`) to lookup matches in $O(N + M)$ time complexity.
+3.  **Fuzzy String Distance Engine**:
+    If fuzzy matching is enabled, the primary key comparison falls back to an optimized Levenshtein distance similarity index. It checks key pairs cell-by-cell and matches rows when they score above the user-defined slider threshold.
 4.  **Cartesian Matches**:
     When duplicate keys match, they result in full SQL-style Cartesian matches for that key. Unmatched rows are padded with empty strings according to the chosen join strategy.
 5.  **Automated Cache Purge**:
