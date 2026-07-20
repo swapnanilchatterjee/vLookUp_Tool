@@ -22,3 +22,11 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Security & Secrets
+PAT.txt
+*.pat
+*.token
+*.env
+*.env.*
+
