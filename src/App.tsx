@@ -18,10 +18,7 @@ import {
   Plus,
   Minus,
   Layers,
-  Combine,
-  FilePlus,
-  Check,
-  HelpCircle
+  Combine
 } from 'lucide-react';
 import './App.css';
 
@@ -1045,7 +1042,7 @@ function App() {
                   onClick={() => fileInputRefs.current[slotIndex]?.click()}
                 >
                   <input
-                    ref={(el) => (fileInputRefs.current[slotIndex] = el)}
+                    ref={(el) => { fileInputRefs.current[slotIndex] = el; }}
                     type="file"
                     accept=".csv, .xlsx, .xls"
                     multiple
