@@ -108,22 +108,21 @@ function App() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Helper to sanitize headers
+  // Helper to sanitize headers with robust uniqueness
   const sanitizeHeaders = (rawHeaders: any[]): string[] => {
-    const seen = new Map<string, number>();
+    const seen = new Set<string>();
     return rawHeaders.map((h, i) => {
       let name = h !== undefined && h !== null ? String(h).trim() : "";
       if (name === "") {
         name = `Column_${i + 1}`;
       }
-      if (seen.has(name)) {
-        const count = seen.get(name)! + 1;
-        seen.set(name, count);
-        return `${name}_${count}`;
-      } else {
-        seen.set(name, 1);
-        return name;
+      let finalName = name;
+      let counter = 2;
+      while (seen.has(finalName)) {
+        finalName = `${name}_${counter++}`;
       }
+      seen.add(finalName);
+      return finalName;
     });
   };
 
@@ -273,7 +272,12 @@ function App() {
     const columns: ColumnConfig[] = headers.map(h => {
       let outputName = h;
       if (existingOutputs.has(outputName) && slotIndex > 0) {
-        outputName = `${h}_File${slotIndex + 1}`;
+        let counter = 1;
+        let candidate = `${h}_File${slotIndex + 1}`;
+        while (existingOutputs.has(candidate)) {
+          candidate = `${h}_File${slotIndex + 1}_${counter++}`;
+        }
+        outputName = candidate;
       }
       existingOutputs.add(outputName);
       return {
@@ -315,10 +319,12 @@ function App() {
           if (!col.selected) return col;
           let outName = col.output.trim();
           if (seenOutputs.has(outName) || outName === "") {
-            outName = `${col.original}_File${file.slotIndex + 1}`;
-            if (seenOutputs.has(outName)) {
-              outName = `${outName}_${Date.now().toString().slice(-4)}`;
+            let candidate = outName !== "" ? `${outName}_File${file.slotIndex + 1}` : `${col.original}_File${file.slotIndex + 1}`;
+            let counter = 1;
+            while (seenOutputs.has(candidate) || candidate === "") {
+              candidate = `${col.original}_File${file.slotIndex + 1}_${counter++}`;
             }
+            outName = candidate;
           }
           seenOutputs.add(outName);
           return { ...col, output: outName };
@@ -1624,6 +1630,10 @@ function App() {
           </div>
         </div>
       </footer>
+
+      <div style={{ textAlign: 'center', margin: '1rem 0 0.25rem 0', fontSize: '0.9rem', fontWeight: 500, color: 'var(--text-muted, #64748b)' }}>
+        Made with ❤️ by Swapnanil
+      </div>
     </>
   );
 }
