@@ -14,60 +14,92 @@ import {
   RefreshCw,
   Info,
   Eye,
-  Sliders
+  Sliders,
+  Plus,
+  Minus,
+  Layers,
+  Combine,
+  FilePlus,
+  Check,
+  HelpCircle
 } from 'lucide-react';
 import './App.css';
 
-interface ParsedFile {
-  name: string;
-  size: number;
-  format: string;
-  headers: string[];
-  data: any[];
-}
+export type OperationMode = 'merge' | 'concat';
 
-interface ColumnConfig {
+export interface ColumnConfig {
   original: string;
   output: string;
   selected: boolean;
 }
 
+export interface LoadedFile {
+  id: string;
+  slotIndex: number;
+  name: string;
+  size: number;
+  format: string;
+  headers: string[];
+  data: any[];
+  columns: ColumnConfig[];
+}
+
+export interface JoinConfig {
+  secondaryFileId: string;
+  targetFileId: string;
+  colTarget: string;
+  colSecondary: string;
+  joinType: 'left' | 'right' | 'inner' | 'outer';
+}
+
 function App() {
-  // File Upload states
-  const [fileA, setFileA] = useState<ParsedFile | null>(null);
-  const [fileB, setFileB] = useState<ParsedFile | null>(null);
-  const [dragActiveA, setDragActiveA] = useState(false);
-  const [dragActiveB, setDragActiveB] = useState(false);
+  // Mode selection: 'merge' or 'concat'
+  const [operationMode, setOperationMode] = useState<OperationMode>('merge');
 
-  // File Inputs references
-  const fileInputRefA = useRef<HTMLInputElement>(null);
-  const fileInputRefB = useRef<HTMLInputElement>(null);
+  // Multi-file dynamic list state
+  const [files, setFiles] = useState<LoadedFile[]>([]);
+  
+  // Track open file slots (min 2 slots)
+  const [slotCount, setSlotCount] = useState<number>(2);
+  const [dragActiveMap, setDragActiveMap] = useState<Record<number, boolean>>({});
 
-  const triggerFileInputA = () => fileInputRefA.current?.click();
-  const triggerFileInputB = () => fileInputRefB.current?.click();
+  // File input refs mapping
+  const fileInputRefs = useRef<Record<number, HTMLInputElement | null>>({});
 
-  // Join Configuration states
-  const [joinKeys, setJoinKeys] = useState<{ colA: string; colB: string }[]>([{ colA: '', colB: '' }]);
-  const [joinType, setJoinType] = useState<'left' | 'right' | 'inner' | 'outer'>('left');
+  // Merge Join configurations for secondary files (files[1] ... files[N-1])
+  const [joinConfigs, setJoinConfigs] = useState<JoinConfig[]>([]);
+  
+  // Merge Matching Parameters
   const [fuzzyMatch, setFuzzyMatch] = useState(false);
   const [fuzzyThreshold, setFuzzyThreshold] = useState(0.8);
-  
-  const [selectedColsA, setSelectedColsA] = useState<ColumnConfig[]>([]);
-  const [selectedColsB, setSelectedColsB] = useState<ColumnConfig[]>([]);
-  
   const [caseInsensitive, setCaseInsensitive] = useState(true);
   const [trimWhitespace, setTrimWhitespace] = useState(true);
-  const [autoClearCache, setAutoClearCache] = useState(true);
 
-  // Output Merged states
-  const [joinedData, setJoinedData] = useState<any[]>([]);
-  const [isMerging, setIsMerging] = useState(false);
+  // Concat Options
+  const [concatAutoAlign, setConcatAutoAlign] = useState(true);
+
+  // Live Preview Row Limit state (10, 25, 50, 100, 250, 500, 1000)
+  const [previewLimit, setPreviewLimit] = useState<number>(10);
+
+  // Manual trigger key to re-evaluate preview engine
+  const [manualRefreshKey, setManualRefreshKey] = useState<number>(0);
+
+  const forceRefreshPreview = () => {
+    setIsProcessing(true);
+    setManualRefreshKey(prev => prev + 1);
+    setAlert({ type: 'info', message: 'Refreshing live output preview table...' });
+  };
+
+  // Cache & Output states
+  const [autoClearCache, setAutoClearCache] = useState(true);
+  const [processedData, setProcessedData] = useState<any[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [outputFormat, setOutputFormat] = useState<'csv' | 'xlsx'>('csv');
-  
-  // Banner / Alert status
+
+  // Banner Alert
   const [alert, setAlert] = useState<{ type: 'info' | 'success' | 'warning' | 'error'; message: string } | null>({
     type: 'info',
-    message: 'Welcome to VMerge Studio. Upload two CSV or Excel files to begin.'
+    message: 'Welcome to VMerge & Concat Studio. Upload two or more files to start merging or concatenating datasets.'
   });
 
   // Format File Size
@@ -79,7 +111,7 @@ function App() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Helper to sanitize headers (remove trailing space, replace empty names, rename duplicate headers)
+  // Helper to sanitize headers
   const sanitizeHeaders = (rawHeaders: any[]): string[] => {
     const seen = new Map<string, number>();
     return rawHeaders.map((h, i) => {
@@ -98,8 +130,60 @@ function App() {
     });
   };
 
-  // Helper to parse file (CSV or Excel)
-  const parseFile = (file: File, isFileA: boolean) => {
+  // Add more file slot
+  const addFileSlot = () => {
+    setSlotCount(prev => prev + 1);
+    setAlert({ type: 'info', message: `Added File Slot ${slotCount + 1}. You can now upload an additional file.` });
+  };
+
+  // Clear loaded dataset for a slot without deleting the slot card
+  const clearSlotFile = (slotIndex: number) => {
+    setFiles(prev => prev.filter(f => f.slotIndex !== slotIndex));
+    setJoinConfigs(prev => prev.filter(jc => {
+      const remainingFiles = files.filter(f => f.slotIndex !== slotIndex);
+      return remainingFiles.some(f => f.id === jc.secondaryFileId);
+    }));
+    setAlert({ type: 'info', message: `Cleared dataset from File ${slotIndex + 1}.` });
+  };
+
+  // Remove file slot card completely (for File 3, File 4, etc. where slotIndex >= 2)
+  const removeFileSlot = (slotIndex: number) => {
+    if (slotCount <= 2) return;
+
+    setFiles(prev => {
+      return prev
+        .filter(f => f.slotIndex !== slotIndex)
+        .map(f => {
+          if (f.slotIndex > slotIndex) {
+            const newSlotIndex = f.slotIndex - 1;
+            return {
+              ...f,
+              slotIndex: newSlotIndex,
+              id: `file_slot_${newSlotIndex}`
+            };
+          }
+          return f;
+        });
+    });
+
+    setSlotCount(prev => prev - 1);
+    setAlert({ type: 'info', message: `Deleted File ${slotIndex + 1} slot.` });
+  };
+
+  // Clear all cache and reset
+  const clearAllCache = () => {
+    setFiles([]);
+    setJoinConfigs([]);
+    setProcessedData([]);
+    setSlotCount(2);
+    setAlert({ type: 'success', message: 'All loaded dataset cache and memory reset successfully.' });
+    Object.values(fileInputRefs.current).forEach(ref => {
+      if (ref) ref.value = '';
+    });
+  };
+
+  // File parsing handler
+  const parseFileForSlot = (file: File, slotIndex: number) => {
     const fileType = file.name.split('.').pop()?.toLowerCase();
 
     if (fileType === 'csv') {
@@ -109,7 +193,7 @@ function App() {
         complete: (results) => {
           const rows = results.data as any[][];
           if (rows.length === 0) {
-            setAlert({ type: 'error', message: "CSV file is empty" });
+            setAlert({ type: 'error', message: `CSV file in slot ${slotIndex + 1} is empty` });
             return;
           }
           const rawHeaders = rows[0] || [];
@@ -123,7 +207,7 @@ function App() {
             return obj;
           });
           
-          onFileParsed(file.name, file.size, 'CSV', cleanHeaders, csvData, isFileA);
+          onSlotFileParsed(file.name, file.size, 'CSV', cleanHeaders, csvData, slotIndex);
         },
         error: (err) => {
           setAlert({ type: 'error', message: `Error parsing CSV: ${err.message}` });
@@ -157,7 +241,7 @@ function App() {
             return obj;
           });
 
-          onFileParsed(file.name, file.size, fileType.toUpperCase(), cleanHeaders, excelData, isFileA);
+          onSlotFileParsed(file.name, file.size, fileType.toUpperCase(), cleanHeaders, excelData, slotIndex);
         } catch (err: any) {
           setAlert({ type: 'error', message: `Error parsing Excel: ${err.message || err}` });
         }
@@ -168,151 +252,270 @@ function App() {
     }
   };
 
-  const onFileParsed = (
+  const onSlotFileParsed = (
     name: string,
     size: number,
     format: string,
     headers: string[],
     data: any[],
-    isFileA: boolean
+    slotIndex: number
   ) => {
-    const parsedFile: ParsedFile = { name, size, format, headers, data };
+    const fileId = `file_slot_${slotIndex}`;
     
-    if (isFileA) {
-      setFileA(parsedFile);
-      setJoinKeys(prev => {
-        const next = [...prev];
-        if (next.length === 0) next.push({ colA: '', colB: '' });
-        next[0] = { ...next[0], colA: headers[0] || '' };
-        return next;
-      });
-      setSelectedColsA(headers.map(h => ({
+    // Collect output names from already loaded files to prevent header collisions
+    const existingOutputs = new Set<string>();
+    files.forEach(f => {
+      if (f.slotIndex !== slotIndex) {
+        f.columns.forEach(c => {
+          if (c.selected && c.output.trim()) existingOutputs.add(c.output.trim());
+        });
+      }
+    });
+
+    // Default column configs with automatic header disambiguation
+    const columns: ColumnConfig[] = headers.map(h => {
+      let outputName = h;
+      if (existingOutputs.has(outputName) && slotIndex > 0) {
+        outputName = `${h}_File${slotIndex + 1}`;
+      }
+      existingOutputs.add(outputName);
+      return {
         original: h,
-        output: h,
+        output: outputName,
         selected: true
-      })));
-    } else {
-      setFileB(parsedFile);
-      setJoinKeys(prev => {
-        const next = [...prev];
-        if (next.length === 0) next.push({ colA: '', colB: '' });
-        next[0] = { ...next[0], colB: headers[0] || '' };
-        return next;
-      });
-      
-      // Auto suffix columns that conflict with File A
-      const fileACols = fileA ? fileA.headers : [];
-      setSelectedColsB(headers.map(h => {
-        const conflict = fileACols.includes(h);
-        return {
-          original: h,
-          output: conflict ? `${h}_B` : h,
-          selected: true
-        };
-      }));
-    }
+      };
+    });
+
+    const newFile: LoadedFile = {
+      id: fileId,
+      slotIndex,
+      name,
+      size,
+      format,
+      headers,
+      data,
+      columns
+    };
+
+    setFiles(prev => {
+      const filtered = prev.filter(f => f.slotIndex !== slotIndex);
+      const updated = [...filtered, newFile].sort((a, b) => a.slotIndex - b.slotIndex);
+      return updated;
+    });
 
     setAlert({
       type: 'success',
-      message: `Successfully loaded ${isFileA ? 'Primary' : 'Lookup'} file: ${name} (${data.length} rows)`
+      message: `Successfully loaded File ${slotIndex + 1}: ${name} (${data.length} rows, ${headers.length} columns)`
     });
   };
 
-  // Drag and Drop handlers
-  const handleDrag = (e: React.DragEvent, isFileA: boolean) => {
+  // Auto-fix header conflicts helper
+  const autoFixHeaderConflicts = () => {
+    setFiles(prevFiles => {
+      const seenOutputs = new Set<string>();
+      return prevFiles.map(file => {
+        const updatedCols = file.columns.map(col => {
+          if (!col.selected) return col;
+          let outName = col.output.trim();
+          if (seenOutputs.has(outName) || outName === "") {
+            outName = `${col.original}_File${file.slotIndex + 1}`;
+            if (seenOutputs.has(outName)) {
+              outName = `${outName}_${Date.now().toString().slice(-4)}`;
+            }
+          }
+          seenOutputs.add(outName);
+          return { ...col, output: outName };
+        });
+        return { ...file, columns: updatedCols };
+      });
+    });
+    setAlert({ type: 'success', message: 'Header conflicts automatically resolved!' });
+  };
+
+
+
+  // Smart Key Matcher for multi-table relational join
+  const findBestKeyMatch = (secFile: LoadedFile, availableTargetFiles: LoadedFile[]) => {
+    if (availableTargetFiles.length === 0) {
+      return { targetFileId: '', colTarget: '', colSecondary: secFile.headers[0] || '' };
+    }
+
+    const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    // 1. Exact case-insensitive match
+    for (const targetFile of availableTargetFiles) {
+      for (const targetHeader of targetFile.headers) {
+        for (const secHeader of secFile.headers) {
+          if (targetHeader.toLowerCase().trim() === secHeader.toLowerCase().trim()) {
+            return {
+              targetFileId: targetFile.id,
+              colTarget: targetHeader,
+              colSecondary: secHeader
+            };
+          }
+        }
+      }
+    }
+
+    // 2. Normalized match (ignoring '_', '-', spaces)
+    for (const targetFile of availableTargetFiles) {
+      for (const targetHeader of targetFile.headers) {
+        for (const secHeader of secFile.headers) {
+          if (normalize(targetHeader) === normalize(secHeader) && normalize(targetHeader).length > 1) {
+            return {
+              targetFileId: targetFile.id,
+              colTarget: targetHeader,
+              colSecondary: secHeader
+            };
+          }
+        }
+      }
+    }
+
+    // 3. Fallback to preceding file with first headers
+    const fallbackTarget = availableTargetFiles[availableTargetFiles.length - 1] || availableTargetFiles[0];
+    return {
+      targetFileId: fallbackTarget.id,
+      colTarget: fallbackTarget.headers[0] || '',
+      colSecondary: secFile.headers[0] || ''
+    };
+  };
+
+  const autoDetectKeyForSecondaryFile = (secFileId: string) => {
+    const secFile = files.find(f => f.id === secFileId);
+    if (!secFile) return;
+
+    const availableTargets = files.filter(f => f.id !== secFileId);
+    const bestMatch = findBestKeyMatch(secFile, availableTargets);
+
+    setJoinConfigs(prev => prev.map(jc => jc.secondaryFileId === secFileId ? {
+      ...jc,
+      targetFileId: bestMatch.targetFileId,
+      colTarget: bestMatch.colTarget,
+      colSecondary: bestMatch.colSecondary
+    } : jc));
+
+    const targetFile = files.find(f => f.id === bestMatch.targetFileId);
+    setAlert({
+      type: 'success',
+      message: `Auto-detected key mapping for ${secFile.name}: Connected to ${targetFile?.name || 'Base File'} on (${bestMatch.colTarget} 🔗 ${bestMatch.colSecondary}).`
+    });
+  };
+
+  // Sync Join Configs whenever loaded files list changes
+  useEffect(() => {
+    if (files.length < 2) {
+      setJoinConfigs([]);
+      return;
+    }
+
+    setJoinConfigs(prevConfigs => {
+      const updatedConfigs: JoinConfig[] = [];
+
+      for (let i = 1; i < files.length; i++) {
+        const secFile = files[i];
+        const existing = prevConfigs.find(c => c.secondaryFileId === secFile.id);
+
+        if (existing && files.some(f => f.id === existing.targetFileId)) {
+          updatedConfigs.push(existing);
+        } else {
+          // Auto-detect best match key with preceding files
+          const availableTargets = files.slice(0, i);
+          const bestMatch = findBestKeyMatch(secFile, availableTargets);
+
+          updatedConfigs.push({
+            secondaryFileId: secFile.id,
+            targetFileId: bestMatch.targetFileId,
+            colTarget: bestMatch.colTarget,
+            colSecondary: bestMatch.colSecondary,
+            joinType: 'left'
+          });
+        }
+      }
+
+      return updatedConfigs;
+    });
+  }, [files]);
+
+  // Batch parse multiple dropped or selected files starting at startSlotIndex
+  const batchParseFiles = (fileList: File[], startSlotIndex: number = 0) => {
+    if (!fileList || fileList.length === 0) return;
+
+    // Filter to supported file formats
+    const validFiles = fileList.filter(f => {
+      const ext = f.name.split('.').pop()?.toLowerCase();
+      return ext === 'csv' || ext === 'xlsx' || ext === 'xls';
+    });
+
+    if (validFiles.length === 0) {
+      setAlert({ type: 'error', message: 'No supported CSV or Excel files found in selection.' });
+      return;
+    }
+
+    // Expand slotCount dynamically if total files exceed current slots
+    const totalNeededSlots = startSlotIndex + validFiles.length;
+    setSlotCount(prev => Math.max(prev, totalNeededSlots));
+
+    // Parse each valid file for its consecutive slot
+    validFiles.forEach((file, index) => {
+      const targetSlot = startSlotIndex + index;
+      parseFileForSlot(file, targetSlot);
+    });
+
+    setAlert({
+      type: 'success',
+      message: `Batch loading ${validFiles.length} file(s): Auto-assigned to File ${startSlotIndex + 1} through File ${startSlotIndex + validFiles.length}.`
+    });
+  };
+
+  // Drag and Drop handlers per slot
+  const handleDrag = (e: React.DragEvent, slotIndex: number) => {
     e.preventDefault();
     e.stopPropagation();
     if (e.type === "dragenter" || e.type === "dragover") {
-      if (isFileA) setDragActiveA(true);
-      else setDragActiveB(true);
+      setDragActiveMap(prev => ({ ...prev, [slotIndex]: true }));
     } else if (e.type === "dragleave") {
-      if (isFileA) setDragActiveA(false);
-      else setDragActiveB(false);
+      setDragActiveMap(prev => ({ ...prev, [slotIndex]: false }));
     }
   };
 
-  const handleDrop = (e: React.DragEvent, isFileA: boolean) => {
+  const handleDrop = (e: React.DragEvent, slotIndex: number) => {
     e.preventDefault();
     e.stopPropagation();
-    if (isFileA) setDragActiveA(false);
-    else setDragActiveB(false);
+    setDragActiveMap(prev => ({ ...prev, [slotIndex]: false }));
 
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      parseFile(e.dataTransfer.files[0], isFileA);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const droppedFiles = Array.from(e.dataTransfer.files);
+      batchParseFiles(droppedFiles, slotIndex);
     }
   };
 
-  const removeFile = (isFileA: boolean) => {
-    if (isFileA) {
-      setFileA(null);
-      setSelectedColsA([]);
-    } else {
-      setFileB(null);
-      setSelectedColsB([]);
-    }
-    setJoinKeys([{ colA: '', colB: '' }]);
-    setJoinedData([]);
-    setAlert({ type: 'info', message: `Removed ${isFileA ? 'Primary' : 'Lookup'} file.` });
+  // Column config update helpers
+  const updateColumnConfig = (fileId: string, colIndex: number, key: keyof ColumnConfig, value: any) => {
+    setFiles(prevFiles => prevFiles.map(file => {
+      if (file.id !== fileId) return file;
+      const nextCols = [...file.columns];
+      nextCols[colIndex] = { ...nextCols[colIndex], [key]: value };
+      return { ...file, columns: nextCols };
+    }));
   };
 
-  const clearAllCache = () => {
-    setFileA(null);
-    setFileB(null);
-    setJoinKeys([{ colA: '', colB: '' }]);
-    setSelectedColsA([]);
-    setSelectedColsB([]);
-    setJoinedData([]);
-    setAlert({ type: 'success', message: 'All file cache and memory reset successfully.' });
-    if (fileInputRefA.current) fileInputRefA.current.value = '';
-    if (fileInputRefB.current) fileInputRefB.current.value = '';
+  const selectAllColumnsForFile = (fileId: string, status: boolean) => {
+    setFiles(prevFiles => prevFiles.map(file => {
+      if (file.id !== fileId) return file;
+      const nextCols = file.columns.map(c => ({ ...c, selected: status }));
+      return { ...file, columns: nextCols };
+    }));
   };
 
-  // Cross-file collision resolver triggered when File A changes
-  useEffect(() => {
-    if (fileA && fileB) {
-      const fileACols = fileA.headers;
-      // Re-evaluate B columns to see if there are new conflicts
-      setSelectedColsB(prev => prev.map(c => {
-        const conflict = fileACols.includes(c.original);
-        // Only update if output hasn't been custom-modified by the user yet
-        if (c.output === c.original && conflict) {
-          return { ...c, output: `${c.original}_B` };
-        }
-        return c;
-      }));
-    }
-  }, [fileA]);
+  const selectAllColumnsGlobal = (status: boolean) => {
+    setFiles(prevFiles => prevFiles.map(file => ({
+      ...file,
+      columns: file.columns.map(c => ({ ...c, selected: status }))
+    })));
+  };
 
-  // Check duplicate output column names in real-time
-  const duplicateOutputNames = useMemo(() => {
-    const names = new Set<string>();
-    const duplicates = new Set<string>();
-
-    selectedColsA.forEach(c => {
-      if (c.selected) {
-        if (names.has(c.output)) duplicates.add(c.output);
-        else names.add(c.output);
-      }
-    });
-
-    selectedColsB.forEach(c => {
-      if (c.selected) {
-        if (names.has(c.output)) duplicates.add(c.output);
-        else names.add(c.output);
-      }
-    });
-
-    return duplicates;
-  }, [selectedColsA, selectedColsB]);
-
-  // Check if any selected output column names are left blank
-  const hasEmptyOutputNames = useMemo(() => {
-    const hasEmptyA = selectedColsA.some(c => c.selected && c.output.trim() === "");
-    const hasEmptyB = selectedColsB.some(c => c.selected && c.output.trim() === "");
-    return hasEmptyA || hasEmptyB;
-  }, [selectedColsA, selectedColsB]);
-
-  // Levenshtein distance function for fuzzy matching
+  // Similarity Levenshtein for fuzzy join
   const getSimilarity = (s1: string, s2: string): number => {
     const len1 = s1.length;
     const len2 = s2.length;
@@ -336,226 +539,342 @@ function App() {
     return (maxLength - matrix[len1][len2]) / maxLength;
   };
 
-  const handleJoinKeyChange = (index: number, side: 'colA' | 'colB', value: string) => {
-    setJoinKeys(prev => {
-      const next = [...prev];
-      next[index] = { ...next[index], [side]: value };
-      return next;
+  // Check duplicate output names within Merge mode
+  const duplicateOutputNames = useMemo(() => {
+    if (operationMode === 'concat') return new Set<string>();
+
+    const names = new Set<string>();
+    const duplicates = new Set<string>();
+
+    files.forEach(file => {
+      file.columns.forEach(c => {
+        if (c.selected) {
+          if (names.has(c.output)) duplicates.add(c.output);
+          else names.add(c.output);
+        }
+      });
     });
-  };
 
-  const addJoinKeyRow = () => {
-    const defaultA = fileA?.headers[0] || '';
-    const defaultB = fileB?.headers[0] || '';
-    setJoinKeys(prev => [...prev, { colA: defaultA, colB: defaultB }]);
-  };
+    return duplicates;
+  }, [files, operationMode]);
 
-  const removeJoinKeyRow = (index: number) => {
-    setJoinKeys(prev => prev.filter((_, i) => i !== index));
-  };
+  // Check empty output column names
+  const hasEmptyOutputNames = useMemo(() => {
+    return files.some(file => file.columns.some(c => c.selected && c.output.trim() === ""));
+  }, [files]);
 
-  // Core Relational Join logic executed inside a debounced useEffect
+  // Auto-align Concat column names when option toggled
   useEffect(() => {
-    if (!fileA || !fileB) {
-      setJoinedData([]);
+    if (operationMode === 'concat' && concatAutoAlign) {
+      setFiles(prevFiles => prevFiles.map(file => {
+        const updatedCols = file.columns.map(c => ({
+          ...c,
+          output: c.original // restore original header name for seamless alignment
+        }));
+        return { ...file, columns: updatedCols };
+      }));
+    }
+  }, [operationMode, concatAutoAlign]);
+
+  // Core Processing Engine (Merge vs Concat) inside debounced Effect
+  useEffect(() => {
+    if (files.length === 0) {
+      setProcessedData([]);
       return;
     }
 
-    setIsMerging(true);
+    setIsProcessing(true);
 
     const timer = setTimeout(() => {
       try {
-        const activeColsA = selectedColsA.filter(c => c.selected).map(c => ({ original: c.original, output: c.output }));
-        const activeColsB = selectedColsB.filter(c => c.selected).map(c => ({ original: c.original, output: c.output }));
+        if (operationMode === 'concat') {
+          // --- CONCAT MODE ENGINE ---
+          // Stack rows across all loaded files
+          const allOutputHeadersSet = new Set<string>();
+          files.forEach(file => {
+            file.columns.forEach(col => {
+              if (col.selected && col.output.trim() !== '') {
+                allOutputHeadersSet.add(col.output.trim());
+              }
+            });
+          });
 
-        // Standardized Join Logic
-        const getKey = (row: any, col: string) => {
-          if (!row) return "";
-          let val = row[col];
-          if (val === undefined || val === null) return "";
-          val = String(val);
-          if (trimWhitespace) val = val.trim();
-          if (caseInsensitive) val = val.toLowerCase();
-          return val;
-        };
+          const outputHeaders = Array.from(allOutputHeadersSet);
+          const concatenatedResult: any[] = [];
 
-        const result: any[] = [];
+          files.forEach(file => {
+            const activeCols = file.columns.filter(c => c.selected && c.output.trim() !== '');
+            file.data.forEach(row => {
+              const rowObj: any = {};
+              // Fill all headers with default empty string
+              outputHeaders.forEach(h => { rowObj[h] = ""; });
+              
+              // Populate values for selected columns in this file
+              activeCols.forEach(c => {
+                const val = row[c.original];
+                rowObj[c.output.trim()] = val !== undefined && val !== null ? val : "";
+              });
+              concatenatedResult.push(rowObj);
+            });
+          });
 
-        if (!fuzzyMatch) {
-          // Fast Indexed Join using Composite Keys
-          const getCompositeKey = (row: any, useColA: boolean) => {
-            return joinKeys.map(jk => getKey(row, useColA ? jk.colA : jk.colB)).join("|||");
+          setProcessedData(concatenatedResult);
+          setAlert(null);
+
+        } else {
+          // --- MERGE MODE ENGINE ---
+          if (files.length < 2) {
+            setProcessedData([]);
+            setIsProcessing(false);
+            return;
+          }
+
+          // Primary file is base slot 0 file (or first available loaded file)
+          const primaryFile = files.find(f => f.slotIndex === 0) || files[0];
+          const activeColsPrimary = primaryFile.columns
+            .filter(c => c.selected)
+            .map(c => ({ original: c.original, output: c.output }));
+
+          // Helper key sanitizer
+          const getKeyVal = (row: any, col: string) => {
+            if (!row) return "";
+            let val = row[col];
+            if (val === undefined || val === null) return "";
+            val = String(val);
+            if (trimWhitespace) val = val.trim();
+            if (caseInsensitive) val = val.toLowerCase();
+            return val;
           };
 
-          const indexB = new Map<string, any[]>();
-          fileB.data.forEach(row => {
-            const key = getCompositeKey(row, false);
-            if (!indexB.has(key)) indexB.set(key, []);
-            indexB.get(key)!.push(row);
-          });
+          // Topological sort of joinConfigs to resolve dependencies cleanly
+          const orderedConfigs: JoinConfig[] = [];
+          const joinedFileIds = new Set<string>([primaryFile.id]);
+          const remainingConfigs = joinConfigs.filter(jc => files.some(f => f.id === jc.secondaryFileId));
 
-          const matchedKeysB = new Set<string>();
+          while (remainingConfigs.length > 0) {
+            let progressMade = false;
 
-          fileA.data.forEach(rowA => {
-            const keyA = getCompositeKey(rowA, true);
-            const matchesB = indexB.get(keyA);
-
-            if (matchesB && matchesB.length > 0) {
-              matchedKeysB.add(keyA);
-              matchesB.forEach(rowB => {
-                const joinedRow: any = {};
-                activeColsA.forEach(c => {
-                  joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
-                });
-                activeColsB.forEach(c => {
-                  joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
-                });
-                result.push(joinedRow);
-              });
-            } else {
-              if (joinType === 'left' || joinType === 'outer') {
-                const joinedRow: any = {};
-                activeColsA.forEach(c => {
-                  joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
-                });
-                activeColsB.forEach(c => {
-                  joinedRow[c.output] = "";
-                });
-                result.push(joinedRow);
+            for (let i = 0; i < remainingConfigs.length; i++) {
+              const config = remainingConfigs[i];
+              if (joinedFileIds.has(config.targetFileId) || !files.some(f => f.id === config.targetFileId)) {
+                orderedConfigs.push(config);
+                joinedFileIds.add(config.secondaryFileId);
+                remainingConfigs.splice(i, 1);
+                progressMade = true;
+                break;
               }
             }
+
+            if (!progressMade) {
+              orderedConfigs.push(...remainingConfigs);
+              break;
+            }
+          }
+
+          // Sequential multi-file join starting with Primary dataset
+          let currentDataSet: any[] = primaryFile.data.map(row => {
+            const baseRow: any = {};
+            activeColsPrimary.forEach(c => {
+              baseRow[c.output] = row[c.original] !== undefined ? row[c.original] : "";
+            });
+            baseRow['_raw_data_' + primaryFile.id] = row;
+            return baseRow;
           });
 
-          if (joinType === 'right' || joinType === 'outer') {
-            fileB.data.forEach(rowB => {
-              const keyB = getCompositeKey(rowB, false);
-              if (!matchedKeysB.has(keyB)) {
-                const joinedRow: any = {};
-                activeColsA.forEach(c => {
-                  joinedRow[c.output] = "";
-                });
-                activeColsB.forEach(c => {
-                  joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
-                });
-                result.push(joinedRow);
-              }
-            });
-          }
-        } else {
-          // Fuzzy Join (nested loops with threshold)
-          const matchedRowsB = new Set<any>();
+          // Join each secondary file according to topological order
+          for (let i = 0; i < orderedConfigs.length; i++) {
+            const jc = orderedConfigs[i];
+            const secFile = files.find(f => f.id === jc.secondaryFileId);
+            if (!secFile) continue;
 
-          fileA.data.forEach(rowA => {
-            let matched = false;
+            const targetFile = files.find(f => f.id === jc.targetFileId) || primaryFile;
+            const activeColsSec = secFile.columns
+              .filter(c => c.selected)
+              .map(c => ({ original: c.original, output: c.output }));
 
-            fileB.data.forEach(rowB => {
-              const firstKeyA = getKey(rowA, joinKeys[0].colA);
-              const firstKeyB = getKey(rowB, joinKeys[0].colB);
-              const sim = getSimilarity(firstKeyA, firstKeyB);
+            const nextMergedResult: any[] = [];
+            const matchedSecRows = new Set<any>();
 
-              if (sim >= fuzzyThreshold) {
-                let remainingMatch = true;
-                for (let k = 1; k < joinKeys.length; k++) {
-                  if (getKey(rowA, joinKeys[k].colA) !== getKey(rowB, joinKeys[k].colB)) {
-                    remainingMatch = false;
-                    break;
+            if (!fuzzyMatch) {
+              // Index Hash Map Join
+              const indexSec = new Map<string, any[]>();
+              secFile.data.forEach(rowSec => {
+                const keySec = getKeyVal(rowSec, jc.colSecondary);
+                if (!indexSec.has(keySec)) indexSec.set(keySec, []);
+                indexSec.get(keySec)!.push(rowSec);
+              });
+
+              currentDataSet.forEach(rowCurr => {
+                const rawTargetRow = rowCurr['_raw_data_' + targetFile.id];
+                const keyTarget = rawTargetRow ? getKeyVal(rawTargetRow, jc.colTarget) : "";
+
+                const matchesSec = indexSec.get(keyTarget);
+
+                if (matchesSec && matchesSec.length > 0) {
+                  matchesSec.forEach(rowSec => {
+                    matchedSecRows.add(rowSec);
+                    const mergedRow = { ...rowCurr };
+                    activeColsSec.forEach(c => {
+                      mergedRow[c.output] = rowSec[c.original] !== undefined ? rowSec[c.original] : "";
+                    });
+                    mergedRow['_raw_data_' + secFile.id] = rowSec;
+                    nextMergedResult.push(mergedRow);
+                  });
+                } else {
+                  if (jc.joinType === 'left' || jc.joinType === 'outer') {
+                    const mergedRow = { ...rowCurr };
+                    activeColsSec.forEach(c => {
+                      mergedRow[c.output] = "";
+                    });
+                    nextMergedResult.push(mergedRow);
                   }
                 }
+              });
 
-                if (remainingMatch) {
-                  matched = true;
-                  matchedRowsB.add(rowB);
-                  
-                  const joinedRow: any = {};
-                  activeColsA.forEach(c => {
-                    joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
+              if (jc.joinType === 'right' || jc.joinType === 'outer') {
+                secFile.data.forEach(rowSec => {
+                  if (!matchedSecRows.has(rowSec)) {
+                    const mergedRow: any = {};
+                    // Fill dummy blank values for previous columns with null safety
+                    if (currentDataSet.length > 0) {
+                      Object.keys(currentDataSet[0]).forEach(k => {
+                        if (!k.startsWith('_raw_data_')) mergedRow[k] = "";
+                      });
+                    } else {
+                      files.forEach(f => {
+                        if (f.id !== secFile.id) {
+                          f.columns.forEach(c => {
+                            if (c.selected) mergedRow[c.output] = "";
+                          });
+                        }
+                      });
+                    }
+                    activeColsSec.forEach(c => {
+                      mergedRow[c.output] = rowSec[c.original] !== undefined ? rowSec[c.original] : "";
+                    });
+                    mergedRow['_raw_data_' + secFile.id] = rowSec;
+                    nextMergedResult.push(mergedRow);
+                  }
+                });
+              }
+            } else {
+              // Fuzzy Join with Levenshtein
+              currentDataSet.forEach(rowCurr => {
+                const rawTargetRow = rowCurr['_raw_data_' + targetFile.id];
+                const keyTarget = rawTargetRow ? getKeyVal(rawTargetRow, jc.colTarget) : "";
+                let hasMatchedSec = false;
+
+                secFile.data.forEach(rowSec => {
+                  const keySec = getKeyVal(rowSec, jc.colSecondary);
+                  const sim = getSimilarity(keyTarget, keySec);
+
+                  if (sim >= fuzzyThreshold) {
+                    hasMatchedSec = true;
+                    matchedSecRows.add(rowSec);
+                    const mergedRow = { ...rowCurr };
+                    activeColsSec.forEach(c => {
+                      mergedRow[c.output] = rowSec[c.original] !== undefined ? rowSec[c.original] : "";
+                    });
+                    mergedRow['_raw_data_' + secFile.id] = rowSec;
+                    nextMergedResult.push(mergedRow);
+                  }
+                });
+
+                if (!hasMatchedSec && (jc.joinType === 'left' || jc.joinType === 'outer')) {
+                  const mergedRow = { ...rowCurr };
+                  activeColsSec.forEach(c => {
+                    mergedRow[c.output] = "";
                   });
-                  activeColsB.forEach(c => {
-                    joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
-                  });
-                  result.push(joinedRow);
+                  nextMergedResult.push(mergedRow);
                 }
+              });
+
+              if (jc.joinType === 'right' || jc.joinType === 'outer') {
+                secFile.data.forEach(rowSec => {
+                  if (!matchedSecRows.has(rowSec)) {
+                    const mergedRow: any = {};
+                    if (currentDataSet.length > 0) {
+                      Object.keys(currentDataSet[0]).forEach(k => {
+                        if (!k.startsWith('_raw_data_')) mergedRow[k] = "";
+                      });
+                    } else {
+                      files.forEach(f => {
+                        if (f.id !== secFile.id) {
+                          f.columns.forEach(c => {
+                            if (c.selected) mergedRow[c.output] = "";
+                          });
+                        }
+                      });
+                    }
+                    activeColsSec.forEach(c => {
+                      mergedRow[c.output] = rowSec[c.original] !== undefined ? rowSec[c.original] : "";
+                    });
+                    mergedRow['_raw_data_' + secFile.id] = rowSec;
+                    nextMergedResult.push(mergedRow);
+                  }
+                });
+              }
+            }
+
+            currentDataSet = nextMergedResult;
+          }
+
+          // Clean up internal raw data references before presenting
+          const cleanedDataSet = currentDataSet.map(row => {
+            const cleanObj: any = {};
+            Object.keys(row).forEach(k => {
+              if (!k.startsWith('_raw_data_')) {
+                cleanObj[k] = row[k];
               }
             });
-
-            if (!matched && (joinType === 'left' || joinType === 'outer')) {
-              const joinedRow: any = {};
-              activeColsA.forEach(c => {
-                joinedRow[c.output] = rowA[c.original] !== undefined ? rowA[c.original] : "";
-              });
-              activeColsB.forEach(c => {
-                joinedRow[c.output] = "";
-              });
-              result.push(joinedRow);
-            }
+            return cleanObj;
           });
 
-          if (joinType === 'right' || joinType === 'outer') {
-            fileB.data.forEach(rowB => {
-              if (!matchedRowsB.has(rowB)) {
-                const joinedRow: any = {};
-                activeColsA.forEach(c => {
-                  joinedRow[c.output] = "";
-                });
-                activeColsB.forEach(c => {
-                  joinedRow[c.output] = rowB[c.original] !== undefined ? rowB[c.original] : "";
-                });
-                result.push(joinedRow);
-              }
+          setProcessedData(cleanedDataSet);
+
+          if (duplicateOutputNames.size > 0) {
+            setAlert({
+              type: 'warning',
+              message: `Header Conflict Warning: Dual output mapping for: [${Array.from(duplicateOutputNames).join(', ')}]. Rename conflicting headers to prevent data overwrites.`
             });
+          } else if (hasEmptyOutputNames) {
+            setAlert({
+              type: 'warning',
+              message: 'Empty Header Warning: One or more selected columns have blank names. Please enter a valid header name.'
+            });
+          } else {
+            setAlert(null);
           }
         }
-
-        setJoinedData(result);
-        if (duplicateOutputNames.size > 0) {
-          setAlert({
-            type: 'warning',
-            message: `Column Name Conflict: Dual output mapping detected for names: [${Array.from(duplicateOutputNames).join(', ')}]. Please rename conflicting output headers below to avoid row overwrites.`
-          });
-        } else if (hasEmptyOutputNames) {
-          setAlert({
-            type: 'warning',
-            message: 'Empty Header Warning: One or more selected output columns have empty names. Please enter a valid header name.'
-          });
-        } else if (fuzzyMatch && (fileA.data.length > 2000 || fileB.data.length > 2000)) {
-          setAlert({
-            type: 'warning',
-            message: `Large Dataset Warning: Fuzzy matching on ${fileA.data.length}x${fileB.data.length} rows may cause browser latency. It is recommended for smaller datasets.`
-          });
-        } else {
-          setAlert(null);
-        }
       } catch (err: any) {
-        setAlert({ type: 'error', message: `Join Engine Failure: ${err.message}` });
+        setAlert({ type: 'error', message: `Processing Engine Failure: ${err.message}` });
       } finally {
-        setIsMerging(false);
+        setIsProcessing(false);
       }
     }, 200);
 
     return () => clearTimeout(timer);
   }, [
-    fileA,
-    fileB,
-    joinKeys,
-    joinType,
-    selectedColsA,
-    selectedColsB,
+    files,
+    operationMode,
+    joinConfigs,
     caseInsensitive,
     trimWhitespace,
+    fuzzyMatch,
+    fuzzyThreshold,
     duplicateOutputNames,
     hasEmptyOutputNames,
-    fuzzyMatch,
-    fuzzyThreshold
+    manualRefreshKey
   ]);
 
-  // Export File & Download Trigger
-  const downloadMergedFile = () => {
-    if (joinedData.length === 0) {
-      setAlert({ type: 'error', message: "Nothing to download. Please verify your datasets and join configuration." });
+  // Export File & Download Handler
+  const downloadProcessedFile = () => {
+    if (processedData.length === 0) {
+      setAlert({ type: 'error', message: "Nothing to download. Please verify your datasets and configuration." });
       return;
     }
 
-    if (duplicateOutputNames.size > 0) {
+    if (operationMode === 'merge' && duplicateOutputNames.size > 0) {
       setAlert({ type: 'error', message: "Cannot export with duplicate output column names. Please rename conflicting headers first." });
       return;
     }
@@ -566,11 +885,11 @@ function App() {
     }
 
     try {
-      const baseName = `merged_${fileA?.name.split('.')[0]}_${fileB?.name.split('.')[0]}`;
-      const filename = `${baseName}_export_${Date.now()}.${outputFormat}`;
+      const modeLabel = operationMode === 'merge' ? 'merged' : 'concatenated';
+      const filename = `${modeLabel}_export_${Date.now()}.${outputFormat}`;
 
       if (outputFormat === 'csv') {
-        const csvContent = Papa.unparse(joinedData);
+        const csvContent = Papa.unparse(processedData);
         const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
@@ -580,15 +899,15 @@ function App() {
         link.click();
         document.body.removeChild(link);
       } else {
-        const worksheet = XLSX.utils.json_to_sheet(joinedData);
+        const worksheet = XLSX.utils.json_to_sheet(processedData);
         const workbook = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(workbook, worksheet, "Joined Dataset");
+        XLSX.utils.book_append_sheet(workbook, worksheet, operationMode === 'merge' ? "Merged Data" : "Concatenated Data");
         XLSX.writeFile(workbook, filename);
       }
 
       setAlert({
         type: 'success',
-        message: `Merge successful! Exported ${joinedData.length} records. File downloaded as: ${filename}`
+        message: `Success! Exported ${processedData.length} records. File downloaded as: ${filename}`
       });
 
       if (autoClearCache) {
@@ -596,7 +915,7 @@ function App() {
           clearAllCache();
           setAlert({
             type: 'success',
-            message: `Merge completed! Memory cache cleared automatically for maximum browser security.`
+            message: `Export completed! Memory cache cleared automatically for maximum security.`
           });
         }, 2000);
       }
@@ -605,57 +924,33 @@ function App() {
     }
   };
 
-  // Helper toggle lists
-  const selectAllA = (status: boolean) => {
-    setSelectedColsA(prev => prev.map(c => ({ ...c, selected: status })));
-  };
-
-  const selectAllB = (status: boolean) => {
-    setSelectedColsB(prev => prev.map(c => ({ ...c, selected: status })));
-  };
-
-  const updateRenameA = (index: number, val: string) => {
-    setSelectedColsA(prev => {
-      const next = [...prev];
-      next[index] = { ...next[index], output: val };
-      return next;
-    });
-  };
-
-  const updateRenameB = (index: number, val: string) => {
-    setSelectedColsB(prev => {
-      const next = [...prev];
-      next[index] = { ...next[index], output: val };
-      return next;
-    });
-  };
-
-  const toggleSelectColA = (index: number) => {
-    setSelectedColsA(prev => {
-      const next = [...prev];
-      next[index] = { ...next[index], selected: !next[index].selected };
-      return next;
-    });
-  };
-
-  const toggleSelectColB = (index: number) => {
-    setSelectedColsB(prev => {
-      const next = [...prev];
-      next[index] = { ...next[index], selected: !next[index].selected };
-      return next;
-    });
-  };
-
-  // Preview rows list limit to 10
+  // Dynamic preview range slice (capped at safe max 1,000 rows to preserve browser DOM performance)
   const previewRows = useMemo(() => {
-    return joinedData.slice(0, 10);
-  }, [joinedData]);
+    const safeLimit = Math.min(previewLimit, 1000);
+    return processedData.slice(0, safeLimit);
+  }, [processedData, previewLimit]);
 
   // Headers for preview
   const previewHeaders = useMemo(() => {
-    if (joinedData.length === 0) return [];
-    return Object.keys(joinedData[0]);
-  }, [joinedData]);
+    if (processedData.length === 0) return [];
+    return Object.keys(processedData[0]);
+  }, [processedData]);
+
+  // Generate slots array for rendering
+  const slotsArray = Array.from({ length: slotCount }, (_, i) => i);
+
+  // Helper to explain disabled state for download button
+  const getDisabledReason = (): string | null => {
+    if (files.length === 0) return "Upload at least one dataset to begin.";
+    if (isProcessing) return "Updating dataset calculations...";
+    if (operationMode === 'merge' && files.length < 2) return "Upload at least 2 datasets for relational merge.";
+    if (operationMode === 'merge' && duplicateOutputNames.size > 0) {
+      return `Duplicate output headers: [${Array.from(duplicateOutputNames).join(', ')}]. Click 🪄 Auto-Fix to resolve.`;
+    }
+    if (hasEmptyOutputNames) return "One or more selected output column headers are empty.";
+    if (processedData.length === 0) return "0 matching rows produced. Check your join key selections or join strategy.";
+    return null;
+  };
 
   return (
     <>
@@ -663,9 +958,29 @@ function App() {
       <header className="header animate-fade-in">
         <div className="logo-container">
           <Shuffle className="logo-icon" />
-          <h1>VMerge Studio</h1>
+          <h1>VMerge & Concat Studio</h1>
         </div>
-        <p>Local-First CSV & Excel Dynamic Joining Engine</p>
+        <p>Local-First CSV & Excel Dynamic Joining & Concatenation Engine</p>
+
+        {/* Operation Mode Selector Bar */}
+        <div style={{ marginTop: '1.5rem', display: 'flex', justifyContent: 'center' }}>
+          <div className="mode-toggle-container">
+            <button
+              className={`mode-toggle-btn ${operationMode === 'merge' ? 'active' : ''}`}
+              onClick={() => setOperationMode('merge')}
+            >
+              <Combine style={{ width: '1.1rem', height: '1.1rem' }} />
+              <span>Merge Mode (Relational Join)</span>
+            </button>
+            <button
+              className={`mode-toggle-btn ${operationMode === 'concat' ? 'active' : ''}`}
+              onClick={() => setOperationMode('concat')}
+            >
+              <Layers style={{ width: '1.1rem', height: '1.1rem' }} />
+              <span>Concat Mode (Row Stacking)</span>
+            </button>
+          </div>
+        </div>
       </header>
 
       {/* Global Alert Banner */}
@@ -684,428 +999,526 @@ function App() {
         </div>
       )}
 
-      {/* Main Grid: File Uploads */}
-      <main className="upload-grid animate-fade-in">
-        
-        {/* File A Card */}
-        <section className="glass-card upload-card">
-          <div className="card-title">
-            <div className="card-title-text">
-              <FileSpreadsheet />
-              <span>Primary Dataset (File A)</span>
+      {/* Main Grid: Multi-File Upload Cards */}
+      <main className="upload-grid-dynamic animate-fade-in">
+        {slotsArray.map((slotIndex) => {
+          const loadedFile = files.find(f => f.slotIndex === slotIndex);
+
+          return (
+            <section key={slotIndex} className="glass-card upload-card">
+              <div className="card-title">
+                <div className="card-title-text">
+                  <FileSpreadsheet />
+                  <span>
+                    {slotIndex === 0
+                      ? 'File 1 (Primary Base)'
+                      : `File ${slotIndex + 1} ${operationMode === 'merge' ? '(Lookup Dataset)' : '(Dataset)'}`}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  {loadedFile && (
+                    <span className="badge badge-primary">{loadedFile.format}</span>
+                  )}
+                  {slotIndex >= 2 && (
+                    <button
+                      className="btn-remove-slot"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeFileSlot(slotIndex);
+                      }}
+                      title={`Remove File ${slotIndex + 1} slot`}
+                      aria-label={`Remove File ${slotIndex + 1} slot`}
+                    >
+                      <Minus style={{ width: '0.85rem', height: '0.85rem', strokeWidth: 2.5 }} />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {!loadedFile ? (
+                <div
+                  className={`drop-zone ${dragActiveMap[slotIndex] ? 'active' : ''}`}
+                  onDragEnter={(e) => handleDrag(e, slotIndex)}
+                  onDragOver={(e) => handleDrag(e, slotIndex)}
+                  onDragLeave={(e) => handleDrag(e, slotIndex)}
+                  onDrop={(e) => handleDrop(e, slotIndex)}
+                  onClick={() => fileInputRefs.current[slotIndex]?.click()}
+                >
+                  <input
+                    ref={(el) => (fileInputRefs.current[slotIndex] = el)}
+                    type="file"
+                    accept=".csv, .xlsx, .xls"
+                    multiple
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        batchParseFiles(Array.from(e.target.files), slotIndex);
+                      }
+                    }}
+                    style={{ display: 'none' }}
+                  />
+                  <UploadCloud className="drop-icon" />
+                  <p>Drag & drop File {slotIndex + 1} (or multiple files) here</p>
+                  <span>Supports single or batch upload of .csv, .xlsx, .xls</span>
+                </div>
+              ) : (
+                <div className="file-details">
+                  <div className="file-header">
+                    <FileSpreadsheet className="file-icon" />
+                    <div className="file-meta">
+                      <div className="file-name" title={loadedFile.name}>{loadedFile.name}</div>
+                      <div className="file-size">{formatBytes(loadedFile.size)}</div>
+                    </div>
+                    <button
+                      className="btn btn-secondary btn-danger"
+                      style={{ padding: '0.45rem' }}
+                      onClick={() => clearSlotFile(slotIndex)}
+                      title="Clear loaded dataset"
+                    >
+                      <Trash2 style={{ width: '1.1rem', height: '1.1rem' }} />
+                    </button>
+                  </div>
+
+                  <div className="stats-grid">
+                    <div className="stat-item">
+                      <div className="stat-label">Total Rows</div>
+                      <div className="stat-value">{loadedFile.data.length}</div>
+                    </div>
+                    <div className="stat-item">
+                      <div className="stat-label">Columns</div>
+                      <div className="stat-value">{loadedFile.headers.length}</div>
+                    </div>
+                  </div>
+
+                  <div className="column-list-preview">
+                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>
+                      Headers Preview:
+                    </div>
+                    <div className="column-chips">
+                      {loadedFile.headers.map((h, i) => (
+                        <span key={i} className="column-chip">{h}</span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
+          );
+        })}
+
+        {/* Plus Button Card to Add More Files */}
+        <div className="glass-card add-file-card" onClick={addFileSlot}>
+          <div className="add-file-inner">
+            <div className="add-file-icon-wrap">
+              <Plus className="add-file-icon" />
             </div>
-            {fileA && (
-              <span className="badge badge-primary">{fileA.format}</span>
-            )}
+            <span className="add-file-title">+ Add Another File</span>
+            <span className="add-file-desc">Click to insert File {slotCount + 1} slot to join or concatenate</span>
           </div>
-
-          {!fileA ? (
-            <div
-              className={`drop-zone ${dragActiveA ? 'active' : ''}`}
-              onDragEnter={(e) => handleDrag(e, true)}
-              onDragOver={(e) => handleDrag(e, true)}
-              onDragLeave={(e) => handleDrag(e, true)}
-              onDrop={(e) => handleDrop(e, true)}
-              onClick={triggerFileInputA}
-            >
-              <input
-                ref={fileInputRefA}
-                type="file"
-                accept=".csv, .xlsx, .xls"
-                onChange={(e) => e.target.files && parseFile(e.target.files[0], true)}
-                style={{ display: 'none' }}
-              />
-              <UploadCloud className="drop-icon" />
-              <p>Drag and drop File A here, or click to browse</p>
-              <span>Supports .csv, .xlsx, .xls</span>
-            </div>
-          ) : (
-            <div className="file-details">
-              <div className="file-header">
-                <FileSpreadsheet className="file-icon" />
-                <div className="file-meta">
-                  <div className="file-name" title={fileA.name}>{fileA.name}</div>
-                  <div className="file-size">{formatBytes(fileA.size)}</div>
-                </div>
-                <button className="btn btn-secondary btn-danger" style={{ padding: '0.45rem' }} onClick={() => removeFile(true)}>
-                  <Trash2 style={{ width: '1.1rem', height: '1.1rem' }} />
-                </button>
-              </div>
-
-              <div className="stats-grid">
-                <div className="stat-item">
-                  <div className="stat-label">Total Rows</div>
-                  <div className="stat-value">{fileA.data.length}</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-label">Columns Detected</div>
-                  <div className="stat-value">{fileA.headers.length}</div>
-                </div>
-              </div>
-
-              <div className="column-list-preview">
-                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Columns list preview:</div>
-                <div className="column-chips">
-                  {fileA.headers.map((h, i) => (
-                    <span key={i} className="column-chip">{h}</span>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-        </section>
-
-        {/* File B Card */}
-        <section className="glass-card upload-card">
-          <div className="card-title">
-            <div className="card-title-text">
-              <FileSpreadsheet />
-              <span>Lookup Dataset (File B)</span>
-            </div>
-            {fileB && (
-              <span className="badge badge-primary">{fileB.format}</span>
-            )}
-          </div>
-
-          {!fileB ? (
-            <div
-              className={`drop-zone ${dragActiveB ? 'active' : ''}`}
-              onDragEnter={(e) => handleDrag(e, false)}
-              onDragOver={(e) => handleDrag(e, false)}
-              onDragLeave={(e) => handleDrag(e, false)}
-              onDrop={(e) => handleDrop(e, false)}
-              onClick={triggerFileInputB}
-            >
-              <input
-                ref={fileInputRefB}
-                type="file"
-                accept=".csv, .xlsx, .xls"
-                onChange={(e) => e.target.files && parseFile(e.target.files[0], false)}
-                style={{ display: 'none' }}
-              />
-              <UploadCloud className="drop-icon" />
-              <p>Drag and drop File B here, or click to browse</p>
-              <span>Supports .csv, .xlsx, .xls</span>
-            </div>
-          ) : (
-            <div className="file-details">
-              <div className="file-header">
-                <FileSpreadsheet className="file-icon" />
-                <div className="file-meta">
-                  <div className="file-name" title={fileB.name}>{fileB.name}</div>
-                  <div className="file-size">{formatBytes(fileB.size)}</div>
-                </div>
-                <button className="btn btn-secondary btn-danger" style={{ padding: '0.45rem' }} onClick={() => removeFile(false)}>
-                  <Trash2 style={{ width: '1.1rem', height: '1.1rem' }} />
-                </button>
-              </div>
-
-              <div className="stats-grid">
-                <div className="stat-item">
-                  <div className="stat-label">Total Rows</div>
-                  <div className="stat-value">{fileB.data.length}</div>
-                </div>
-                <div className="stat-item">
-                  <div className="stat-label">Columns Detected</div>
-                  <div className="stat-value">{fileB.headers.length}</div>
-                </div>
-              </div>
-
-              <div className="column-list-preview">
-                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Columns list preview:</div>
-                <div className="column-chips">
-                  {fileB.headers.map((h, i) => (
-                    <span key={i} className="column-chip">{h}</span>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-        </section>
+        </div>
       </main>
 
-      {/* Config Section (Only when both files are uploaded) */}
-      {fileA && fileB && (
+      {/* Mode-Specific Settings & Configuration Section */}
+      {files.length > 0 && (
         <section className="glass-card config-section animate-fade-in">
+          
+          {/* Mode Header */}
           <div className="section-header">
-            <Settings className="section-icon" />
-            <h2 className="section-title">Configure Relational Join</h2>
+            {operationMode === 'merge' ? (
+              <>
+                <Settings className="section-icon" />
+                <h2 className="section-title">Configure Relational Join (Merge)</h2>
+              </>
+            ) : (
+              <>
+                <Layers className="section-icon" />
+                <h2 className="section-title">Configure Row Concatenation</h2>
+              </>
+            )}
           </div>
 
-          {/* Join Key Selection List */}
-          <div className="form-group">
-            <div className="join-keys-list">
-              {joinKeys.map((keyRow, index) => (
-                <div key={index} className="join-key-row">
-                  <div>
-                    <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.25rem' }}>Match Column from File A</label>
-                    <select
-                      className="select-control"
-                      value={keyRow.colA}
-                      onChange={(e) => handleJoinKeyChange(index, 'colA', e.target.value)}
-                    >
-                      {fileA.headers.map((h, i) => (
-                        <option key={i} value={h}>{h}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.25rem' }}>Matches Column from File B</label>
-                    <select
-                      className="select-control"
-                      value={keyRow.colB}
-                      onChange={(e) => handleJoinKeyChange(index, 'colB', e.target.value)}
-                    >
-                      {fileB.headers.map((h, i) => (
-                        <option key={i} value={h}>{h}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    {joinKeys.length > 1 && (
-                      <button
-                        className="btn btn-secondary btn-danger btn-icon-only"
-                        type="button"
-                        onClick={() => removeJoinKeyRow(index)}
-                        style={{ height: '42px', width: '42px' }}
-                      >
-                        <Trash2 style={{ width: '1rem', height: '1rem' }} />
-                      </button>
-                    )}
-                  </div>
+          {/* MERGE MODE CONFIGURATIONS */}
+          {operationMode === 'merge' && (
+            <>
+              {files.length < 2 ? (
+                <div className="alert-banner info" style={{ marginBottom: '1.5rem' }}>
+                  <Info className="alert-banner-icon" />
+                  <span>Upload at least two files above to configure match keys and perform a relational join.</span>
                 </div>
-              ))}
-            </div>
-            <button
-              className="btn btn-secondary"
-              type="button"
-              onClick={addJoinKeyRow}
-              style={{ fontSize: '0.85rem', padding: '0.5rem 1rem' }}
-            >
-              + Add Match Key
-            </button>
-          </div>
+              ) : (
+                <>
+                  {/* Relational Join Flow Pipeline Diagram */}
+                  <div className="relational-pipeline-banner">
+                    <div className="pipeline-title">Live Relational Joining Chain Diagram:</div>
+                    <div className="pipeline-nodes">
+                      <div className="pipeline-node primary">
+                        <span className="node-badge">Primary Base</span>
+                        <span className="node-name" title={files[0].name}>{files[0].name}</span>
+                      </div>
+                      {joinConfigs.map((jc, idx) => {
+                        const secFile = files.find(f => f.id === jc.secondaryFileId);
+                        const targetFile = files.find(f => f.id === jc.targetFileId);
+                        if (!secFile || !targetFile) return null;
 
-          {/* Join Type Selectors */}
-          <div className="form-group">
-            <label className="form-label">Join Type Strategy</label>
-            <div className="join-types-selector">
-              <div
-                className={`join-type-card ${joinType === 'left' ? 'selected' : ''}`}
-                onClick={() => setJoinType('left')}
-              >
-                <div className="join-type-title">Left Join</div>
-                <div className="join-type-desc">All rows of File A, with matched values from B (VLookup standard).</div>
-              </div>
+                        return (
+                          <React.Fragment key={jc.secondaryFileId}>
+                            <div className="pipeline-arrow">
+                              <span className="arrow-label" title={`${targetFile.name} (${jc.colTarget}) = ${secFile.name} (${jc.colSecondary})`}>
+                                {jc.colTarget} 🔗 {jc.colSecondary} ({jc.joinType})
+                              </span>
+                              <div className="arrow-line">➔</div>
+                            </div>
+                            <div className="pipeline-node">
+                              <span className="node-badge">Join #{idx + 1}</span>
+                              <span className="node-name" title={secFile.name}>{secFile.name}</span>
+                            </div>
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
+                  </div>
 
-              <div
-                className={`join-type-card ${joinType === 'inner' ? 'selected' : ''}`}
-                onClick={() => setJoinType('inner')}
-              >
-                <div className="join-type-title">Inner Join</div>
-                <div className="join-type-desc">Only rows where the selected columns have matches in both files.</div>
-              </div>
+                  <div className="form-group">
+                    <label className="form-label" style={{ fontWeight: 600, fontSize: '0.95rem' }}>
+                      Multi-Dataset Relational Key Mapping
+                    </label>
+                    <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1rem' }}>
+                      Link each secondary dataset to any preceding table and choose matching key columns.
+                    </p>
 
-              <div
-                className={`join-type-card ${joinType === 'right' ? 'selected' : ''}`}
-                onClick={() => setJoinType('right')}
-              >
-                <div className="join-type-title">Right Join</div>
-                <div className="join-type-desc">All rows of File B, with matched values from A.</div>
-              </div>
+                    <div className="join-configs-container">
+                      {joinConfigs.map((jc, index) => {
+                        const secFile = files.find(f => f.id === jc.secondaryFileId);
+                        const targetFile = files.find(f => f.id === jc.targetFileId) || files[0];
+                        if (!secFile) return null;
 
-              <div
-                className={`join-type-card ${joinType === 'outer' ? 'selected' : ''}`}
-                onClick={() => setJoinType('outer')}
-              >
-                <div className="join-type-title">Full Outer Join</div>
-                <div className="join-type-desc">All rows from both files. Merges matching lines where keys intersect.</div>
-              </div>
-            </div>
-          </div>
+                        return (
+                          <div key={jc.secondaryFileId} className="join-key-row-card">
+                            <div className="join-row-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span className="badge badge-primary">Join #{index + 1}: {secFile.name}</span>
+                              <button
+                                className="btn btn-secondary btn-xs"
+                                style={{ color: 'var(--primary-hover)', borderColor: 'rgba(139, 92, 246, 0.3)' }}
+                                onClick={() => autoDetectKeyForSecondaryFile(secFile.id)}
+                                title="Auto-detect best matching column names"
+                              >
+                                ⚡ Auto-Detect Key
+                              </button>
+                            </div>
 
-          {/* Match Parameters Options */}
-          <div className="options-panel">
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                className="checkbox-control"
-                checked={caseInsensitive}
-                onChange={(e) => setCaseInsensitive(e.target.checked)}
-              />
-              <span>Case-Insensitive Match (e.g. "key" matches "KEY")</span>
-            </label>
+                            <div className="join-row-controls-grid">
+                              {/* Step 1: Select Target File */}
+                              <div className="join-step-control">
+                                <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.35rem' }}>
+                                  1. Connect To Table
+                                </label>
+                                <select
+                                  className="select-control"
+                                  value={jc.targetFileId}
+                                  onChange={(e) => {
+                                    const newTargetId = e.target.value;
+                                    const newTargetFile = files.find(f => f.id === newTargetId) || files[0];
+                                    const autoMatch = findBestKeyMatch(secFile, [newTargetFile]);
+                                    setJoinConfigs(prev => prev.map(c => c.secondaryFileId === jc.secondaryFileId ? {
+                                      ...c,
+                                      targetFileId: newTargetId,
+                                      colTarget: autoMatch.colTarget,
+                                      colSecondary: autoMatch.colSecondary
+                                    } : c));
+                                  }}
+                                >
+                                  {files.filter(f => f.id !== secFile.id).map(f => (
+                                    <option key={f.id} value={f.id}>
+                                      File {f.slotIndex + 1}: {f.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
 
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                className="checkbox-control"
-                checked={trimWhitespace}
-                onChange={(e) => setTrimWhitespace(e.target.checked)}
-              />
-              <span>Trim Whitespace (ignores leading/trailing spaces)</span>
-            </label>
+                              {/* Step 2: Select Column in Target File */}
+                              <div className="join-step-control">
+                                <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.35rem' }}>
+                                  2. Column in File {targetFile.slotIndex + 1} ({targetFile.name})
+                                </label>
+                                <select
+                                  className="select-control"
+                                  value={jc.colTarget}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    setJoinConfigs(prev => prev.map(c => c.secondaryFileId === jc.secondaryFileId ? {
+                                      ...c,
+                                      colTarget: val
+                                    } : c));
+                                  }}
+                                >
+                                  {targetFile.headers.map((h, i) => (
+                                    <option key={i} value={h}>{h}</option>
+                                  ))}
+                                </select>
+                              </div>
 
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                className="checkbox-control"
-                checked={fuzzyMatch}
-                onChange={(e) => setFuzzyMatch(e.target.checked)}
-              />
-              <span style={{ color: 'var(--primary-hover)', fontWeight: 600 }}>Enable Fuzzy Match (Levenshtein Distance)</span>
-            </label>
-          </div>
+                              {/* Step 3: Select Column in Current Secondary File */}
+                              <div className="join-step-control">
+                                <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.35rem' }}>
+                                  3. Column in File {secFile.slotIndex + 1} ({secFile.name})
+                                </label>
+                                <select
+                                  className="select-control"
+                                  value={jc.colSecondary}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    setJoinConfigs(prev => prev.map(c => c.secondaryFileId === jc.secondaryFileId ? {
+                                      ...c,
+                                      colSecondary: val
+                                    } : c));
+                                  }}
+                                >
+                                  {secFile.headers.map((h, i) => (
+                                    <option key={i} value={h}>{h}</option>
+                                  ))}
+                                </select>
+                              </div>
 
-          {/* Fuzzy Threshold Slider */}
-          {fuzzyMatch && (
-            <div className="slider-container animate-fade-in" style={{ padding: '1rem', background: 'rgba(255, 255, 255, 0.02)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', marginBottom: '1.5rem' }}>
-              <div className="slider-header">
-                <span>Fuzzy Match Similarity Threshold</span>
-                <span style={{ color: 'var(--primary-hover)', fontWeight: 600 }}>{Math.round(fuzzyThreshold * 100)}% Match</span>
-              </div>
-              <input
-                type="range"
-                className="range-input"
-                min="0.5"
-                max="1.0"
-                step="0.05"
-                value={fuzzyThreshold}
-                onChange={(e) => setFuzzyThreshold(parseFloat(e.target.value))}
-              />
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-                Note: Fuzzy matching evaluates string similarity on the primary match key. Lower percentages accept looser spelling matches.
-              </div>
+                              {/* Step 4: Select Join Strategy */}
+                              <div className="join-step-control">
+                                <label className="form-label" style={{ fontSize: '0.75rem', marginBottom: '0.35rem' }}>
+                                  4. Relational Strategy
+                                </label>
+                                <select
+                                  className="select-control"
+                                  value={jc.joinType}
+                                  onChange={(e) => {
+                                    const val = e.target.value as any;
+                                    setJoinConfigs(prev => prev.map(c => c.secondaryFileId === jc.secondaryFileId ? {
+                                      ...c,
+                                      joinType: val
+                                    } : c));
+                                  }}
+                                >
+                                  <option value="left">Left Join (VLookup standard)</option>
+                                  <option value="inner">Inner Join (Matched only)</option>
+                                  <option value="right">Right Join (All secondary)</option>
+                                  <option value="outer">Full Outer Join</option>
+                                </select>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Matching Options Panel */}
+                  <div className="options-panel">
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        className="checkbox-control"
+                        checked={caseInsensitive}
+                        onChange={(e) => setCaseInsensitive(e.target.checked)}
+                      />
+                      <span>Case-Insensitive Match (e.g. "key" matches "KEY")</span>
+                    </label>
+
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        className="checkbox-control"
+                        checked={trimWhitespace}
+                        onChange={(e) => setTrimWhitespace(e.target.checked)}
+                      />
+                      <span>Trim Whitespace (ignores leading/trailing spaces)</span>
+                    </label>
+
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        className="checkbox-control"
+                        checked={fuzzyMatch}
+                        onChange={(e) => setFuzzyMatch(e.target.checked)}
+                      />
+                      <span style={{ color: 'var(--primary-hover)', fontWeight: 600 }}>Enable Fuzzy Match (Levenshtein Distance)</span>
+                    </label>
+                  </div>
+
+                  {/* Fuzzy Slider */}
+                  {fuzzyMatch && (
+                    <div className="slider-container animate-fade-in" style={{ padding: '1rem', background: 'rgba(255, 255, 255, 0.02)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-color)', marginBottom: '1.5rem' }}>
+                      <div className="slider-header">
+                        <span>Fuzzy Match Similarity Threshold</span>
+                        <span style={{ color: 'var(--primary-hover)', fontWeight: 600 }}>{Math.round(fuzzyThreshold * 100)}% Match</span>
+                      </div>
+                      <input
+                        type="range"
+                        className="range-input"
+                        min="0.5"
+                        max="1.0"
+                        step="0.05"
+                        value={fuzzyThreshold}
+                        onChange={(e) => setFuzzyThreshold(parseFloat(e.target.value))}
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          {/* CONCAT MODE CONFIGURATIONS */}
+          {operationMode === 'concat' && (
+            <div className="options-panel" style={{ marginBottom: '1.5rem' }}>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  className="checkbox-control"
+                  checked={concatAutoAlign}
+                  onChange={(e) => setConcatAutoAlign(e.target.checked)}
+                />
+                <span style={{ fontWeight: 600, color: 'var(--primary-hover)' }}>
+                  Auto-Align Identical Header Names Across Files
+                </span>
+              </label>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', display: 'block', width: '100%', marginTop: '-0.5rem' }}>
+                When checked, columns with matching original names across uploaded files will be combined into unified output columns automatically.
+              </span>
             </div>
           )}
 
-          {/* Dynamic Column Schema Setup */}
-          <div className="section-header" style={{ borderBottom: 'none', marginBottom: '0.5rem' }}>
-            <Sliders className="section-icon" />
-            <h2 className="section-title">Map Output Fields & Schema</h2>
+          {/* DYNAMIC FIELD SELECTION & SCHEMA MAPPER FOR ALL FILES */}
+          <div className="section-header" style={{ borderBottom: 'none', marginBottom: '0.5rem', marginTop: '1rem', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <Sliders className="section-icon" />
+              <h2 className="section-title">Select Columns & Map Output Schema</h2>
+            </div>
+            {files.length > 0 && (
+              <div className="quick-actions" style={{ gap: '0.5rem' }}>
+                <button className="btn btn-secondary btn-xs" style={{ padding: '0.35rem 0.65rem' }} onClick={() => selectAllColumnsGlobal(true)}>
+                  Select All (All Files)
+                </button>
+                <button className="btn btn-secondary btn-xs" style={{ padding: '0.35rem 0.65rem' }} onClick={() => selectAllColumnsGlobal(false)}>
+                  Deselect All (All Files)
+                </button>
+              </div>
+            )}
           </div>
           <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem', textAlign: 'left' }}>
-            Select which columns will appear in your merged file and dynamically rename their output headers.
+            Choose which columns to include from each file and specify their target header names for the export.
           </p>
 
-          <div className="schema-grid">
-            
-            {/* File A Schema */}
-            <div className="glass-card schema-column-card" style={{ background: 'rgba(0, 0, 0, 0.1)' }}>
-              <div className="schema-headers-bar">
-                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>File A Columns</span>
-                <div className="quick-actions">
-                  <button className="btn btn-secondary btn-xs" onClick={() => selectAllA(true)}>Select All</button>
-                  <button className="btn btn-secondary btn-xs" onClick={() => selectAllA(false)}>Deselect All</button>
+          <div className="schema-grid-multi">
+            {files.map((file) => (
+              <div key={file.id} className="glass-card schema-column-card" style={{ background: 'rgba(0, 0, 0, 0.1)' }}>
+                <div className="schema-headers-bar">
+                  <span className="schema-file-title" title={`File ${file.slotIndex + 1}: ${file.name}`}>
+                    File {file.slotIndex + 1}: {file.name}
+                  </span>
+                  <div className="quick-actions">
+                    <button className="btn btn-secondary btn-xs" onClick={() => selectAllColumnsForFile(file.id, true)}>Select All</button>
+                    <button className="btn btn-secondary btn-xs" onClick={() => selectAllColumnsForFile(file.id, false)}>Deselect All</button>
+                  </div>
+                </div>
+
+                <div className="schema-list">
+                  {file.columns.map((col, cIndex) => {
+                    const isConflict = duplicateOutputNames.has(col.output) && col.selected;
+                    return (
+                      <div
+                        key={cIndex}
+                        className={`schema-item ${col.selected ? 'selected' : ''} ${isConflict ? 'conflict-warning' : ''}`}
+                        onClick={() => updateColumnConfig(file.id, cIndex, 'selected', !col.selected)}
+                        style={{ cursor: 'pointer' }}
+                      >
+                        <input
+                          type="checkbox"
+                          className="checkbox-control"
+                          checked={col.selected}
+                          onChange={(e) => updateColumnConfig(file.id, cIndex, 'selected', e.target.checked)}
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                        <div className="schema-col-info">
+                          <div className="schema-col-name" title={col.original}>
+                            {col.original}
+                          </div>
+                        </div>
+                        {col.selected && (
+                          <input
+                            type="text"
+                            className="schema-rename-input"
+                            value={col.output}
+                            placeholder="Output Header..."
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => updateColumnConfig(file.id, cIndex, 'output', e.target.value)}
+                            title="Dynamic column rename"
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
-
-              <div className="schema-list">
-                {selectedColsA.map((col, index) => {
-                  const isConflict = duplicateOutputNames.has(col.output) && col.selected;
-                  return (
-                    <div key={index} className={`schema-item ${col.selected ? 'selected' : ''} ${isConflict ? 'conflict-warning' : ''}`}>
-                      <input
-                        type="checkbox"
-                        className="checkbox-control"
-                        checked={col.selected}
-                        onChange={() => toggleSelectColA(index)}
-                      />
-                      <div className="schema-col-info">
-                        <div className="schema-col-name" title={col.original}>
-                          {col.original}
-                          {joinKeys.some(jk => jk.colA === col.original) && (
-                            <span className="badge badge-success" style={{ marginLeft: '0.5rem', fontSize: '0.65rem' }}>Match Key</span>
-                          )}
-                        </div>
-                      </div>
-                      {col.selected && (
-                        <input
-                          type="text"
-                          className="schema-rename-input"
-                          value={col.output}
-                          placeholder="Output Header..."
-                          onChange={(e) => updateRenameA(index, e.target.value)}
-                          title="Dynamic column rename"
-                        />
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* File B Schema */}
-            <div className="glass-card schema-column-card" style={{ background: 'rgba(0, 0, 0, 0.1)' }}>
-              <div className="schema-headers-bar">
-                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>File B Columns</span>
-                <div className="quick-actions">
-                  <button className="btn btn-secondary btn-xs" onClick={() => selectAllB(true)}>Select All</button>
-                  <button className="btn btn-secondary btn-xs" onClick={() => selectAllB(false)}>Deselect All</button>
-                </div>
-              </div>
-
-              <div className="schema-list">
-                {selectedColsB.map((col, index) => {
-                  const isConflict = duplicateOutputNames.has(col.output) && col.selected;
-                  return (
-                    <div key={index} className={`schema-item ${col.selected ? 'selected' : ''} ${isConflict ? 'conflict-warning' : ''}`}>
-                      <input
-                        type="checkbox"
-                        className="checkbox-control"
-                        checked={col.selected}
-                        onChange={() => toggleSelectColB(index)}
-                      />
-                      <div className="schema-col-info">
-                        <div className="schema-col-name" title={col.original}>
-                          {col.original}
-                          {joinKeys.some(jk => jk.colB === col.original) && (
-                            <span className="badge badge-success" style={{ marginLeft: '0.5rem', fontSize: '0.65rem' }}>Match Key</span>
-                          )}
-                        </div>
-                      </div>
-                      {col.selected && (
-                        <input
-                          type="text"
-                          className="schema-rename-input"
-                          value={col.output}
-                          placeholder="Output Header..."
-                          onChange={(e) => updateRenameB(index, e.target.value)}
-                          title="Dynamic column rename"
-                        />
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
+            ))}
           </div>
+
         </section>
       )}
 
-      {/* Preview Section */}
-      {fileA && fileB && (
+      {/* Live Preview Section */}
+      {files.length > 0 && (
         <section className="glass-card preview-section animate-fade-in">
-          <div className="section-header" style={{ justifyContent: 'space-between' }}>
+          <div className="section-header" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
               <Eye className="section-icon" />
               <h2 className="section-title">
-                Live Output Preview
-                {isMerging && (
+                Live Output Preview ({operationMode === 'merge' ? 'Merge' : 'Concat'})
+                {isProcessing && (
                   <RefreshCw className="spinner" style={{ marginLeft: '0.75rem', width: '1rem', height: '1rem', color: 'var(--primary)' }} />
                 )}
               </h2>
             </div>
-            {joinedData.length > 0 && (
-              <span className="badge badge-success">
-                {joinedData.length} records matched
-              </span>
-            )}
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+              <button
+                className="btn btn-secondary btn-xs"
+                style={{ padding: '0.35rem 0.65rem', display: 'flex', alignItems: 'center', gap: '0.35rem', color: 'var(--primary-hover)', borderColor: 'rgba(139, 92, 246, 0.3)' }}
+                onClick={forceRefreshPreview}
+                disabled={isProcessing}
+                title="Manually re-calculate and refresh live output preview table"
+              >
+                <RefreshCw className={isProcessing ? "spinner" : ""} style={{ width: '0.85rem', height: '0.85rem' }} />
+                <span>Refresh Table</span>
+              </button>
+
+              {processedData.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                  <label style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', fontWeight: 500 }}>
+                    Preview Range:
+                  </label>
+                  <select
+                    className="select-control"
+                    style={{ width: 'auto', padding: '0.25rem 0.6rem', fontSize: '0.8rem', height: 'auto', borderRadius: 'var(--radius-sm)' }}
+                    value={previewLimit}
+                    onChange={(e) => setPreviewLimit(Number(e.target.value))}
+                  >
+                    <option value={10}>Top 10 rows</option>
+                    <option value={25}>Top 25 rows</option>
+                    <option value={50}>Top 50 rows</option>
+                    <option value={100}>Top 100 rows</option>
+                    <option value={250}>Top 250 rows</option>
+                    <option value={500}>Top 500 rows</option>
+                    <option value={1000}>Top 1,000 rows (Max Preview)</option>
+                  </select>
+                </div>
+              )}
+
+              {processedData.length > 0 && (
+                <span className="badge badge-success">
+                  {processedData.length.toLocaleString()} records processed
+                </span>
+              )}
+            </div>
           </div>
 
           <div className="table-wrapper">
-            {joinedData.length > 0 ? (
+            {processedData.length > 0 ? (
               <table className="preview-table">
                 <thead>
                   <tr>
@@ -1128,51 +1541,71 @@ function App() {
               </table>
             ) : (
               <div className="empty-preview">
-                {isMerging ? 'Updating join map...' : 'No matches found based on the current keys. Verify matching values.'}
+                {isProcessing ? 'Processing datasets...' : 'No processed rows available. Check uploaded files and key selections.'}
               </div>
             )}
           </div>
-          {joinedData.length > 10 && (
+          {processedData.length > 0 && (
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textAlign: 'right', marginTop: '0.5rem' }}>
-              Showing first 10 rows of {joinedData.length} matching rows.
+              Showing {previewRows.length} of {processedData.length.toLocaleString()} total processed records (Preview capped at max 1,000 rows to safeguard browser DOM performance).
             </div>
           )}
         </section>
       )}
 
-      {/* Export Section */}
-      {fileA && fileB && (
-        <div className="actions-panel animate-fade-in">
-          <div className="format-picker">
+      {/* Actions & Export Panel */}
+      {files.length > 0 && (
+        <div className="actions-panel animate-fade-in" style={{ flexDirection: 'column', gap: '1.25rem' }}>
+          <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center' }}>
+            <div className="format-picker">
+              <button
+                className={`format-btn ${outputFormat === 'csv' ? 'active' : ''}`}
+                onClick={() => setOutputFormat('csv')}
+              >
+                CSV
+              </button>
+              <button
+                className={`format-btn ${outputFormat === 'xlsx' ? 'active' : ''}`}
+                onClick={() => setOutputFormat('xlsx')}
+              >
+                EXCEL
+              </button>
+            </div>
+
             <button
-              className={`format-btn ${outputFormat === 'csv' ? 'active' : ''}`}
-              onClick={() => setOutputFormat('csv')}
+              className="btn btn-primary"
+              onClick={downloadProcessedFile}
+              disabled={processedData.length === 0 || duplicateOutputNames.size > 0 || hasEmptyOutputNames || isProcessing}
             >
-              CSV
+              <Download style={{ width: '1.25rem', height: '1.25rem' }} />
+              <span>Generate & Download {operationMode === 'merge' ? 'Merged' : 'Concatenated'} File</span>
             </button>
-            <button
-              className={`format-btn ${outputFormat === 'xlsx' ? 'active' : ''}`}
-              onClick={() => setOutputFormat('xlsx')}
-            >
-              EXCEL
+
+            {duplicateOutputNames.size > 0 && (
+              <button
+                className="btn btn-secondary"
+                style={{ color: '#fbbf24', borderColor: 'rgba(245, 158, 11, 0.4)', background: 'rgba(245, 158, 11, 0.1)' }}
+                onClick={autoFixHeaderConflicts}
+                title="Auto-fix conflicting header names"
+              >
+                🪄 Auto-Fix Header Conflicts
+              </button>
+            )}
+
+            <button className="btn btn-secondary" onClick={clearAllCache}>
+              <Trash2 style={{ width: '1.2rem', height: '1.2rem' }} />
+              <span>Wipe App Cache</span>
             </button>
           </div>
 
-          <button
-            className="btn btn-primary"
-            onClick={downloadMergedFile}
-            disabled={joinedData.length === 0 || duplicateOutputNames.size > 0 || hasEmptyOutputNames || isMerging}
-          >
-            <Download style={{ width: '1.25rem', height: '1.25rem' }} />
-            <span>Generate & Download Merged File</span>
-          </button>
+          {getDisabledReason() && (
+            <div className="alert-banner warning" style={{ margin: 0, padding: '0.65rem 1rem', fontSize: '0.825rem' }}>
+              <AlertCircle className="alert-banner-icon" style={{ width: '1.1rem', height: '1.1rem' }} />
+              <span>{getDisabledReason()}</span>
+            </div>
+          )}
 
-          <button className="btn btn-secondary" onClick={clearAllCache}>
-            <Trash2 style={{ width: '1.2rem', height: '1.2rem' }} />
-            <span>Wipe App Cache</span>
-          </button>
-
-          <label className="checkbox-label" style={{ marginLeft: '0.5rem' }}>
+          <label className="checkbox-label">
             <input
               type="checkbox"
               className="checkbox-control"
@@ -1184,14 +1617,13 @@ function App() {
         </div>
       )}
 
-      {/* Footer / Privacy Policy */}
+      {/* Local Privacy Guarantee */}
       <footer className="privacy-card animate-fade-in">
         <ShieldCheck className="privacy-icon" />
         <div>
           <div className="privacy-title">Local Browser Sandbox Protection</div>
           <div className="privacy-desc">
-            All data parsing, key matching, dynamic remapping, and file exports are executed purely inside your local browser instance.
-            Absolutely no files, credentials, or keys are uploaded to any server. Your datasets remain completely secure and private.
+            All file uploads, row concatenation, key merging, field remapping, and file generation run 100% locally in your web browser. No data is sent to external servers.
           </div>
         </div>
       </footer>
